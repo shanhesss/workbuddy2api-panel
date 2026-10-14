@@ -36,7 +36,7 @@ docs/
 !README.md
 
 # Windows binaries
-/wb2api.exe
+/wb2api*.exe
 /login.exe
 /credit.exe
 
