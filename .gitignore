@@ -15,6 +15,7 @@ data/
 
 # Config with secrets (use config.example.json)
 config.json
+/config.json.bak
 
 # Build artifacts
 *.tmp
