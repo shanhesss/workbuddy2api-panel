@@ -30,6 +30,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/httpauth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/scheduler"
 	"github.com/misakano7545/workbuddy2api-panel/internal/updater"
@@ -40,6 +41,7 @@ import (
 // Config 面板依赖（main 装配注入）。
 type Config struct {
 	Pool      *pool.Pool
+	ProxyPool *proxypool.Manager
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	// AutoTasksEnabled 与成长任务开关共用热配置；nil 时只允许手动启动后台任务。
@@ -94,10 +96,11 @@ type Config struct {
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
 // 本 mux 的 pattern 均带 /panel 前缀（外层不做前缀剥离）。
 type Panel struct {
-	cfg     Config
-	mux     *http.ServeMux
-	started time.Time
-	logs    *Ring
+	proxyAccountMu sync.Mutex
+	cfg            Config
+	mux            *http.ServeMux
+	started        time.Time
+	logs           *Ring
 
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
@@ -110,6 +113,12 @@ type Panel struct {
 	// 不同账号之间不互斥（并行照旧）。TryLock 语义，锁条目常驻（账号数有界）。
 	taskMu    sync.Mutex
 	taskLocks map[string]*sync.Mutex
+
+	// softRateMu/softRateUntil 上游软限流（429）的账号级冷却截止：撞过一次就记下来，
+	// 同一轮里后续任务动作直接快失败，不每个动作都再睡一遍——一轮全量任务有几十个
+	// 动作，逐个睡会让后台作业卡住几十分钟，还占着 taskLocks 把手动触发一起堵死。
+	softRateMu    sync.Mutex
+	softRateUntil map[string]time.Time
 
 	// batchRunning 手动全量运维接口（签到/旅行/活跃/保活/余额）共用的防重入闸门：
 	// 这些动作都是逐号打上游，并发跑两轮 = 每号至少翻倍上游请求，正是批间节流
@@ -226,6 +235,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/theme.js", p.themeScript)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	p.proxyRoutes()
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/error_summary", p.withAuth(p.errorSummary))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
@@ -360,6 +370,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 模型降级路由表：前端据它标注「⤳ 已路由至 X」（限流的模型若配了等价模型）。
 		"model_fallback": p.modelFallbackSnapshot(),
 		"accounts":       p.cfg.Pool.List(),
+		"proxy_pool":     p.proxySnapshot(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久，移植上游
 		// PR #120）：与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -586,7 +597,14 @@ func (p *Panel) nicknames() map[string]string {
 // （有错误明细回 502，一个账号都没有回 503）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
-	var fetchErrs []string
+	// catalogErrs = 目录探测失败（决定「整份视图是否可信」→ 报 502 / 不写缓存）；
+	// busyErrs = 繁忙度观测失败（**只是少一列**，目录本身已经拿到）。
+	//
+	// 两者必须分开：此前只有 fetchErrs 一个切片，国际版 /v2/chat/busy 恒 404（见
+	// upstream/modelbusy.go）就永久占着一条错误，于是 `len(fetchErrs)==0` 的写缓存条件
+	// 永远不成立——只要池里有 global 账号，模型目录缓存完全失效，面板每次刷新都实打上游。
+	var catalogErrs []string
+	var busyErrs []string
 
 	// refresh=1：强制重探 global 目录（issue #216 现象 3）。此前按钮只是重读 1h 缓存，
 	// 上游目录变了也纹丝不动。CN 侧本来就是每请求直连上游（无缓存），无需处理。
@@ -611,7 +629,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			cnAcct = acct
 			infos, err := p.cfg.Upstream.FetchModels(acct)
 			if err != nil {
-				fetchErrs = append(fetchErrs, "cn: "+err.Error())
+				catalogErrs = append(catalogErrs, "cn: "+err.Error())
 			} else {
 				for _, mi := range infos {
 					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
@@ -628,7 +646,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 				globalAcct = acct
 				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
 				if len(infos) == 0 {
-					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
+					catalogErrs = append(catalogErrs, "global: 上游未返回可用模型")
 				} else {
 					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
 					for _, mi := range infos {
@@ -709,8 +727,8 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 模型繁忙度（官方 /v2/chat/busy，只读观测，见 upstream/modelbusy.go）：与目录同一批
-	// 账号查，附到对应域的行上。查不到就不填字段（不编造）；失败只并入 fetchErrs（目录本身
-	// 已经拿到了，不该因为繁忙度查询失败把整个视图打成 502）。
+	// 账号查，附到对应域的行上。查不到就不填字段（不编造）；失败只并入 busyErrs（目录本身
+	// 已经拿到了，不该因为繁忙度查询失败把整个视图打成 502，更不该阻断目录缓存）。
 	for realm, acct := range map[string]*auth.Auth{"cn": cnAcct, "global": globalAcct} {
 		if acct == nil {
 			continue
@@ -727,7 +745,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 		levels, err := p.cfg.Upstream.ModelBusy(acct, ids)
 		if err != nil {
-			fetchErrs = append(fetchErrs, realm+" busy: "+err.Error())
+			busyErrs = append(busyErrs, realm+" busy: "+err.Error())
 			continue
 		}
 		for _, e := range out {
@@ -740,15 +758,16 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(out) == 0 {
-		if len(fetchErrs) > 0 {
-			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
+		if errs := append(append([]string{}, catalogErrs...), busyErrs...); len(errs) > 0 {
+			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(errs, "; "))
 			return
 		}
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
 	globalSource := p.cfg.Upstream.GlobalCatalogSource()
-	if len(fetchErrs) == 0 {
+	// 只有目录错误才拒绝写缓存；繁忙度失败不阻断（否则国际版恒 404 会让缓存永久失效）。
+	if len(catalogErrs) == 0 {
 		p.storeModelsCache(&modelsCacheEntry{models: out, globalSource: globalSource})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -758,6 +777,9 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		// 前端据此提示「拿到的是回落/降级目录」——issue #216 里用户只看到「少了 11 个模型」，
 		// 完全不知道已经降级到企业端点（那份目录只有 18 条、hy4-preview 的倍率还是旧值）。
 		"global_source": globalSource,
+		// busy_errs 繁忙度观测失败明细（目录不受影响）：国际版没有 /v2/chat/busy，
+		// 首轮会在这里出现一条，之后按域短路不再产生。
+		"busy_errs": busyErrs,
 	})
 }
 
@@ -1085,7 +1107,19 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
+	p.proxyAccountMu.Lock()
+	defer p.proxyAccountMu.Unlock()
 	uid := r.PathValue("uid")
+	if p.cfg.Pool.AuthByUID(uid) == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if p.cfg.ProxyPool != nil {
+		if err := p.cfg.ProxyPool.Unbind(uid); err != nil {
+			writeErr(w, http.StatusInternalServerError, "save account proxy binding failed")
+			return
+		}
+	}
 	a := p.cfg.Pool.Remove(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")

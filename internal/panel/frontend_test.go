@@ -1469,7 +1469,7 @@ const ctx = {
   esc: (s) => String(s),
 };
 vm.createContext(ctx);
-vm.runInContext("'use strict';\n" + src.slice(start) + '\nthis.loadPackages = loadPackages;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, src.indexOf('const PROXY_STATES', start)) + '\nthis.loadPackages = loadPackages;', ctx);
 (async () => {
   await ctx.loadPackages();                       // 冷：首次进入 → 打上游
   const cold = { calls: calls.length, rendered: rendered.slice() };
@@ -1673,6 +1673,12 @@ func TestPanelRemarkWiring(t *testing.T) {
 		"function remarkKey(",
 		"function remarkName(",
 		"function storeRemarks(",
+		// 行内「备注」按钮 + 分发 + 单账号过滤 + 合并保存：少任一处，行内按钮点了没反应
+		// 或保存后别的号备注被清空，而 Go 编译与 JS 语法检查都发现不了。
+		`data-a="remark"`,
+		"if (a === 'remark') { openRemarks(u); return; }",
+		"rows = rows.filter(r => r.uid === k);",
+		"const map = Object.assign({}, remarksAll());",
 	} {
 		if !bytes.Contains(js, []byte(want)) {
 			t.Fatalf("app.js 缺少 %s", want)

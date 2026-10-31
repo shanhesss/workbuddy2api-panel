@@ -39,9 +39,9 @@ func withTestSite(t *testing.T, base string, id string) {
 	t.Cleanup(func() { siteResolver = orig })
 }
 
-// TestLoginStartRecordsSiteAndDecoratesURL 覆盖 login/start：返回的授权链接必须带
-// 官方 version 参数，且会话记录 site（poll 据此选端点，防止 codebuddy.ai 与
-// workbuddy.ai 混用）。
+// TestLoginStartRecordsSiteAndDecoratesURL 覆盖 login/start：返回的授权链接不发
+// version（授权页只读 platform/fromSource），且会话记录 site（poll 据此选端点，
+// 防止 codebuddy.ai 与 workbuddy.ai 混用）。
 func TestLoginStartRecordsSiteAndDecoratesURL(t *testing.T) {
 	var gotPlatform string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,11 +79,11 @@ func TestLoginStartRecordsSiteAndDecoratesURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("解析授权 URL 失败 %q: %v", rawURL, err)
 	}
-	if v := u.Query().Get("version"); v != loginsite.ClientVersion {
-		t.Errorf("授权链接缺 version（或值不符）：%q", rawURL)
+	if v := u.Query().Get("version"); v != "" {
+		t.Errorf("授权链接不该带 version：%q", rawURL)
 	}
-	if gotPlatform != "CLI" {
-		t.Errorf("platform=%q want CLI", gotPlatform)
+	if gotPlatform != "workbuddy-ai" {
+		t.Errorf("platform=%q want workbuddy-ai（intl 站点真机口径）", gotPlatform)
 	}
 
 	// 会话必须记住站点，否则 poll 会按 cn 端点去问，永远拿不到 token。

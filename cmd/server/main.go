@@ -28,6 +28,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/panel"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
@@ -149,6 +150,7 @@ func main() {
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+	p.SetBalanceWindow(cfg.BalanceWindowDur)             // 窗口用量调度（issue #112，默认 1h；0 关停）
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	p.SetCreditFloorMaxRate(cfg.Pool.CreditFloorMaxRate) // 保底兜底的目录倍率上限（0 = 严格模式）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
@@ -207,6 +209,13 @@ func main() {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
+	proxies, err := proxypool.New(stateSibling(cfg.StateFile, "proxy-pool.json"),
+		up.HTTP.Transport.(*http.Transport), upstream.NewDNSDialer(cfg.DNSServers))
+	if err != nil {
+		log.Fatalf("proxy pool: %v", err)
+	}
+	defer proxies.Close()
+	up.ProxyPool = proxies
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(cfg.Features.SanitizeBrandScope)
 	// 思考档位策略（thinking 节）：启动装载，面板保存配置时经 saveConfig 热更新。
@@ -269,7 +278,6 @@ func main() {
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
-		BlackcatHours:  cfg.Schedule.BlackcatHours,
 		GrowthHours:    cfg.Schedule.GrowthHours,
 		// 余额采样记录器：挂在余额刷新之后（scheduler 内），nil = 不采样。
 		Balance: bal,
@@ -279,7 +287,6 @@ func main() {
 		TravelDisabled:     !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
-		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 周期保活只刷新临期凭证（默认 7 天窗口）；面板手动全量保活不受影响。
 		KeepaliveRefreshWindow: cfg.KeepaliveRefreshWindowDur,
@@ -316,12 +323,6 @@ func main() {
 		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
 	}
 	switch {
-	case !cfg.Schedule.BlackcatEnabled:
-		log.Printf("夜猫子已禁用（schedule.blackcat_enabled=false）")
-	default:
-		log.Printf("夜猫子已启用：%v 点（23:00–08:00 窗口 glm-5.2 对话补足）", cfg.Schedule.BlackcatHours)
-	}
-	switch {
 	case !cfg.Schedule.GrowthEnabled:
 		log.Printf("成长任务队列已禁用（schedule.growth_enabled=false）")
 	default:
@@ -350,9 +351,6 @@ func main() {
 	if cfg.Schedule.BalanceRefreshJitterPermill > 0 {
 		log.Printf("周期抖动（人味化）：余额刷新 ±%d‰（账号遍历同步摊开）、补领清扫 ±%d‰，不再精确固定间隔（schedule.*_jitter_permill）",
 			cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
-	}
-	if cfg.Schedule.NightAccountCap > 0 {
-		log.Printf("夜间参与上限：夜猫子只让积分最高的前 %d 个号参加（schedule.night_account_cap）", cfg.Schedule.NightAccountCap)
 	}
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
@@ -426,6 +424,7 @@ func main() {
 	var pn *panel.Panel
 	pn = panel.New(panel.Config{
 		Pool:       p,
+		ProxyPool:  proxies,
 		Usage:      rec,
 		RequestLog: requestLog,
 		Upstream:   up,
@@ -531,6 +530,13 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	proxyCtx, stopProxies := context.WithCancel(ctx)
+	proxyDone := make(chan struct{})
+	go func() {
+		defer close(proxyDone)
+		proxies.Run(proxyCtx)
+	}()
+	defer func() { stopProxies(); <-proxyDone }()
 	updateManager.SetRestart(stop)
 	go updateManager.Run(ctx)
 	// 账号后台任务（taskjobs）：状态与主 state 同目录，重启后自动恢复未完成作业。
@@ -542,7 +548,6 @@ func main() {
 	pn.ResumeTaskJobs()
 	go sch.Run(ctx)
 	sch.SetJitter(cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
-	sch.SetNightAccountCap(cfg.Schedule.NightAccountCap)
 	sch.SetMakeupCardsPerRound(cfg.Schedule.MakeupCardsPerRound)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
@@ -848,6 +853,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		ThinkingClientPriority: newCfg.Thinking.ClientPriority,
 		ThinkingOverrideScope:  newCfg.Thinking.OverrideScope,
 		ThinkingModelDefaults:  newCfg.Thinking.ModelDefaults,
+		ModelFallback:          newCfg.Pool.ModelFallback,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(newCfg.Features.SanitizeBrandScope)
@@ -859,6 +865,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
+	p.SetBalanceWindow(newCfg.BalanceWindowDur)             // 窗口用量调度热生效（0 关停）
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetCreditFloorMaxRate(newCfg.Pool.CreditFloorMaxRate) // 保底倍率上限热生效（0 = 严格模式）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
@@ -873,14 +880,12 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		TravelHours:    newCfg.Schedule.TravelHours,
 		ActivityHours:  newCfg.Schedule.ActivityHours,
 		KeepaliveHours: newCfg.Schedule.KeepaliveHours,
-		BlackcatHours:  newCfg.Schedule.BlackcatHours,
 		GrowthHours:    newCfg.Schedule.GrowthHours,
 
 		CheckinDisabled:        !newCfg.Schedule.CheckinEnabled,
 		TravelDisabled:         !newCfg.Schedule.TravelEnabled,
 		ActivityDisabled:       !newCfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:      !newCfg.Schedule.KeepaliveEnabled,
-		BlackcatDisabled:       !newCfg.Schedule.BlackcatEnabled,
 		GrowthDisabled:         !newCfg.Schedule.GrowthEnabled,
 		IncludeDisabledInTasks: newCfg.Schedule.IncludeDisabledInTasks,
 
@@ -891,7 +896,6 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetJitter(newCfg.Schedule.BalanceRefreshJitterPermill, newCfg.Schedule.TaskSweepJitterPermill)
-	sch.SetNightAccountCap(newCfg.Schedule.NightAccountCap)
 	sch.SetMakeupCardsPerRound(newCfg.Schedule.MakeupCardsPerRound)
 	if pn != nil {
 		pn.SetGrowthConcurrency(newCfg.Schedule.GrowthConcurrency) // 排程轮次并发热生效
@@ -904,11 +908,14 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	return restartRequiredFields(baseline, newCfg), nil
 }
 
-// applyCNChatBase 把 config cn.chat_base 装配进上游 client；空则保留内置默认，
-// 老配置（无 cn 段）行为不变。
+// applyCNChatBase 把 config cn.chat_base / cn.billing_base 装配进上游 client；
+// 空则保留内置默认，老配置（无 cn 段）行为不变。
 func applyCNChatBase(up *upstream.Client, cfg *Config) {
 	if cfg.CN.ChatBase != "" {
 		up.ChatBaseCN = cfg.CN.ChatBase
+	}
+	if cfg.CN.BillingBase != "" {
+		up.BillingBaseCN = cfg.CN.BillingBase
 	}
 }
 
@@ -936,8 +943,9 @@ func restartRequiredFields(current, next *Config) []string {
 	changed("upstream.device_token", current.Upstream.DeviceToken, next.Upstream.DeviceToken)
 	changed("upstream.device_token_file", current.Upstream.DeviceTokenFile, next.Upstream.DeviceTokenFile)
 	changed("upstream.passthrough_ip", current.Upstream.PassthroughIP, next.Upstream.PassthroughIP)
-	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（请求路径并发读取，不做热改）。
+	// cn.chat_base / cn.billing_base 同样只在装配期写进上游 client（请求路径并发读取，不做热改）。
 	changed("cn.chat_base", current.CN.ChatBase, next.CN.ChatBase)
+	changed("cn.billing_base", current.CN.BillingBase, next.CN.BillingBase)
 	changed("global.enabled", current.Global.Enabled, next.Global.Enabled)
 	changed("global.chat_base", current.Global.ChatBase, next.Global.ChatBase)
 	changed("global.billing_base", current.Global.BillingBase, next.Global.BillingBase)

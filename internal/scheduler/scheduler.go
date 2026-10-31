@@ -35,7 +35,6 @@ type Config struct {
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
-	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
 	GrowthHours    []int // 默认 [11]：成长任务队列（任务中心待办）每日自动跑一遍
 
 	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
@@ -58,8 +57,6 @@ type Config struct {
 	ActivityDisabled bool
 	// KeepaliveDisabled 显式关闭 token 保活排程（schedule.keepalive_enabled=false）。
 	KeepaliveDisabled bool
-	// BlackcatDisabled 显式关闭夜猫子排程（schedule.blackcat_enabled=false）。
-	BlackcatDisabled bool
 	// GrowthDisabled 显式关闭成长任务队列排程（schedule.growth_enabled=false）。
 	GrowthDisabled bool
 	// IncludeDisabledInTasks 让「保号类」四任务（签到 / 活跃上报 / token 保活 /
@@ -118,10 +115,6 @@ type Scheduler struct {
 	balanceJitter atomic.Int64
 	sweepJitter   atomic.Int64
 
-	// nightAccountCap 夜间任务参与上限（>0 = 只让积分最高的前 N 个号参加夜猫子）。
-	// atomic 读写，Reconfigure 可热改。0 = 不限（旧行为）。
-	nightAccountCap atomic.Int64
-
 	// makeupPerRound 每轮连登管家最多用几张补签卡（0 = 不限，补到卡用光）。
 	// atomic 读写，Reconfigure 可热改（schedule.makeup_cards_per_round）。
 	makeupPerRound atomic.Int64
@@ -146,6 +139,9 @@ type Scheduler struct {
 	// 供面板「到期提醒」标注数据年龄：卡片展示的是这份快照，必须让年龄可读，
 	// 否则界面 5 秒轮询会让人误以为数据也是 5 秒级新鲜。
 	lastBalanceRefresh atomic.Int64
+	// webLeg 网页通道每日活跃的当日去重表（仅国际版，见 webactivity.go）。
+	// 放 Scheduler 上而不是包级变量：多实例/测试各自独立，互不污染。
+	webLeg webLegDay
 }
 
 // New 构建。
@@ -161,9 +157,6 @@ func New(cfg Config) *Scheduler {
 	}
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveHours = []int{22}
-	}
-	if len(cfg.BlackcatHours) == 0 {
-		cfg.BlackcatHours = []int{23}
 	}
 	if len(cfg.GrowthHours) == 0 {
 		cfg.GrowthHours = []int{11}
@@ -188,14 +181,12 @@ type ScheduleParams struct {
 	TravelHours    []int
 	ActivityHours  []int
 	KeepaliveHours []int
-	BlackcatHours  []int
 	GrowthHours    []int
 
 	CheckinDisabled   bool
 	TravelDisabled    bool
 	ActivityDisabled  bool
 	KeepaliveDisabled bool
-	BlackcatDisabled  bool
 	GrowthDisabled    bool
 	// IncludeDisabledInTasks 保号类四任务是否覆盖禁用账号（见 Config 同名字段）。
 	IncludeDisabledInTasks bool
@@ -247,10 +238,10 @@ func (s *Scheduler) SetKeepaliveRefreshWindow(d time.Duration) {
 // Reconfigure 热更新排程参数（面板保存配置后调用）：改时点/开关并通知运行中的循环重算。
 // 空 hours 视为「未配置」保留原值（与 config.normalize 的回落语义一致）。
 func (s *Scheduler) Reconfigure(p ScheduleParams) {
-	hours := [][]int{p.CheckinHours, p.TravelHours, p.ActivityHours, p.KeepaliveHours, p.BlackcatHours, p.GrowthHours}
+	hours := [][]int{p.CheckinHours, p.TravelHours, p.ActivityHours, p.KeepaliveHours, p.GrowthHours}
 	s.schedMu.Lock()
 	dst := []*[]int{&s.cfg.CheckinHours, &s.cfg.TravelHours, &s.cfg.ActivityHours,
-		&s.cfg.KeepaliveHours, &s.cfg.BlackcatHours, &s.cfg.GrowthHours}
+		&s.cfg.KeepaliveHours, &s.cfg.GrowthHours}
 	for i, h := range hours {
 		if len(h) > 0 {
 			*dst[i] = h
@@ -260,7 +251,6 @@ func (s *Scheduler) Reconfigure(p ScheduleParams) {
 	s.cfg.TravelDisabled = p.TravelDisabled
 	s.cfg.ActivityDisabled = p.ActivityDisabled
 	s.cfg.KeepaliveDisabled = p.KeepaliveDisabled
-	s.cfg.BlackcatDisabled = p.BlackcatDisabled
 	s.cfg.GrowthDisabled = p.GrowthDisabled
 	s.cfg.IncludeDisabledInTasks = p.IncludeDisabledInTasks
 	s.cfg.JitterMinutes = p.JitterMinutes
@@ -323,8 +313,6 @@ func (k taskKind) String() string {
 		return "activity"
 	case taskKeepalive:
 		return "keepalive"
-	case taskBlackcat:
-		return "blackcat"
 	case taskGrowth:
 		return "growth"
 	default:
@@ -373,7 +361,6 @@ const (
 	taskTravel
 	taskActivity
 	taskKeepalive
-	taskBlackcat
 	taskGrowth
 )
 
@@ -399,7 +386,6 @@ func (s *Scheduler) enabledSlots(now time.Time) []plannedSlot {
 		{s.cfg.TravelDisabled, s.cfg.TravelHours, taskTravel},
 		{s.cfg.ActivityDisabled, s.cfg.ActivityHours, taskActivity},
 		{s.cfg.KeepaliveDisabled, s.cfg.KeepaliveHours, taskKeepalive},
-		{s.cfg.BlackcatDisabled, s.cfg.BlackcatHours, taskBlackcat},
 		{s.cfg.GrowthDisabled, s.cfg.GrowthHours, taskGrowth},
 	}
 	jitter := s.cfg.JitterMinutes
@@ -417,10 +403,10 @@ func (s *Scheduler) enabledSlots(now time.Time) []plannedSlot {
 
 // missedToday 返回「今天的时点已全部过去」的启用任务族（下一次触发已落到别的日子）。
 // 进程停机跨过时点后重启时用它补跑——迟到唤醒补跑只管「进程活着、timer 被睡眠冻结」，
-// 管不到进程本身没在跑。各任务按天幂等（夜猫子等窗口类自带守卫），补一轮无副作用。
+// 管不到进程本身没在跑。各任务按天幂等，补一轮无副作用。
 //
-// shortcut: 判据只看「下一次触发是否落在今天」，跨零点窗口（夜猫子 23:00–08:00）
-// 若在 00:00–08:00 之间重启，昨夜那一轮不会被补——真有这种重启再升级判据。
+// shortcut: 判据只看「下一次触发是否落在今天」，若跨零点重启，昨夜那一轮不会被补
+// ——真有这种重启再升级判据。
 func (s *Scheduler) missedToday(now time.Time) []taskKind {
 	var out []taskKind
 	for _, sl := range s.enabledSlots(now) {
@@ -543,7 +529,7 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 func (s *Scheduler) Run(ctx context.Context) {
 	// 启动补跑：进程停机（部署 / 重启 / 崩溃）跨过今天的时点，迟到唤醒补跑救不了
 	// ——它只管进程活着时 timer 被睡眠冻结。这里补一轮：各任务按天幂等，
-	// 窗口类（夜猫子）自带守卫，重复一轮不会打出无意义请求。
+	// 重复一轮不会打出无意义请求。
 	if missed := s.missedToday(cst.Now()); len(missed) > 0 {
 		log.Printf("启动补跑：%v（今天的时点已过）", missed)
 		if !sleepCtx(ctx, wakeupGraceDelay) {
@@ -619,8 +605,6 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 				s.runActivity(ctx, spread)
 			case taskKeepalive:
 				s.runKeepalive(ctx, spread, true)
-			case taskBlackcat:
-				s.runBlackcat(ctx, spread)
 			case taskGrowth:
 				s.RunGrowthNow()
 			}
@@ -679,10 +663,16 @@ func (s *Scheduler) runCheckin(ctx context.Context, spread bool) {
 		if a == nil || (a.RefreshTokenValue() == "" && !a.IsAPIKey()) {
 			continue
 		}
-		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
-		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
-		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
+		// 国际版签到：**不是**「无签到体系」——checkin-activity-status 与 daily-checkin
+		// 两个端点在国际域都存在（2026-10-29 复验：前者 200，后者在活动未开启时
+		// 400 code=10001），国际客户端的 main/account.js 里也有 checkinStatus /
+		// claimDailyCheckin 两个方法。与 CN 的差别只在**判据**：国际版活动长期处于
+		// 未配置状态（active=false、start/end 全空），盲发写请求只会每天撞一次 10001，
+		// 白白多一次风控面。故国际版走「先查 status，仅 active 且当日未签才 claim」。
+		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级
+		// 为 cn、按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global）。
 		if a.IsGlobal() {
+			s.checkinGlobal(a)
 			continue
 		}
 		if !plan.wait(ctx, st.UID) {
@@ -796,9 +786,14 @@ func (s *Scheduler) runActivity(ctx context.Context, spread bool) {
 		cid := session.NewConversationID()
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			log.Printf("WARN: activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
-			continue
+		} else {
+			s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
 		}
-		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
+		// 国际版另有网页通道腿（issue #111）：上报只点亮连登，每日 30/50 积分认的是
+		// 「跑完的网页 agent 会话」。**放在上报之外**——上报偶发失败不该连带丢掉当日
+		// 积分（两条腿在上游是各自独立的判据）。国内版在 runWebActivityLeg 内部
+		// 按 IsGlobal 直接返回，零上游调用。
+		s.runWebActivityLeg(ctx, a)
 	}
 }
 
@@ -973,17 +968,6 @@ func (s *Scheduler) SetJitter(balancePermill, sweepPermill int) {
 	s.sweepJitter.Store(int64(sweepPermill))
 }
 
-// SetNightAccountCap 热改夜间参与上限；<0 视为 0（不限）。
-func (s *Scheduler) SetNightAccountCap(n int) {
-	if n < 0 {
-		n = 0
-	}
-	s.nightAccountCap.Store(int64(n))
-}
-
-// NightAccountCap 当前夜间参与上限。
-func (s *Scheduler) NightAccountCap() int { return int(s.nightAccountCap.Load()) }
-
 // SetMakeupCardsPerRound 热改每轮补签卡上限；<0 视为 0（不限）。
 func (s *Scheduler) SetMakeupCardsPerRound(n int) {
 	if n < 0 {
@@ -994,21 +978,6 @@ func (s *Scheduler) SetMakeupCardsPerRound(n int) {
 
 // MakeupCardsPerRound 当前每轮补签卡上限（0 = 不限）。
 func (s *Scheduler) MakeupCardsPerRound() int { return int(s.makeupPerRound.Load()) }
-
-// capByCredits 夜间任务候选收窄：按积分降序取前 cap 个（余额未知/相同的顺序不稳定，
-// 但候选集每天基本不变，无需额外确定性）。cap<=0 或候选不超上限时原样返回。
-func capByCredits(list []pool.Status, cap int) []pool.Status {
-	if cap <= 0 || len(list) <= cap {
-		return list
-	}
-	sorted := append([]pool.Status(nil), list...)
-	for i := 1; i < len(sorted); i++ {
-		for j := i; j > 0 && sorted[j].Credits > sorted[j-1].Credits; j-- {
-			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
-		}
-	}
-	return sorted[:cap]
-}
 
 // periodicJitterFor 当前生效的周期抖动（千分比 → 比例）。
 func (s *Scheduler) periodicJitterFor(sweep bool) float64 {

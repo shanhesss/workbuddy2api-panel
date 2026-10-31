@@ -17,9 +17,12 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
 const (
@@ -32,6 +35,18 @@ const (
 // 只读、无副作用；失败原样返回错误（调用方不填即可，不得据此改变选号）。
 func (c *Client) ModelBusy(a *auth.Auth, models []string) (map[string]string, error) {
 	out := map[string]string{}
+	// 国际版没有这条端点：2026-10-29 5.9.3 真机抓包（www.workbuddy.ai）10 次 POST /v2/chat/busy
+	// 全部 404，同一 token 直连复验也是 404 {"error_msg":"404 Route Not Found"}，而国内版同路径 200。
+	// 官方客户端自己也在打这条不存在的路径（说明是服务端没部署，不是我们路径写错）。
+	//
+	// 一旦探到 404 就记住，本进程后续调用直接返回空表：繁忙度是**纯观测**数据（见文件头），
+	// 拿到 404 既不值得每轮刷新重试一次、也不该让上层把「观测失败」记成错误（面板会把
+	// busy 失败并进目录错误列表，进而拒绝写目录缓存）。
+	//
+	// 自愈口子：上游若补上该端点，重启进程即重新探测（不做持久化），不需要改代码。
+	if c.globalOn(a) && c.modelBusyUnsupported.Load() {
+		return out, nil
+	}
 	for i := 0; i < len(models); i += modelBusyBatch {
 		end := i + modelBusyBatch
 		if end > len(models) {
@@ -45,10 +60,42 @@ func (c *Client) ModelBusy(a *auth.Auth, models []string) (map[string]string, er
 		if err != nil {
 			return out, err
 		}
+		// 头族按真机 /v2/chat/busy 逐头对齐——**不是** chat 那套重头族：
+		//
+		//	Accept: application/json, text/plain, */*
+		//	Content-Type: application/json
+		//	User-Agent: <RPC 族>   CN  WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+		//	                      GL  workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0
+		//	X-Request-ID / X-Product: SaaS / Authorization / X-User-Id / X-Domain
+		//
+		// 真机这条路径**不发** X-Conversation-* / acp-connection-id / baggage / b3 /
+		// x-stainless-* / x-codebuddy-request，也没有 X-Requested-With。旧实现直接复用
+		// ChatHeaders，等于给一个官方轻请求套上 20 多个它从不发的头。
+		//
+		// UA 取 rpcUAFor（首段即品牌 slug），不是 userAgent（chat 的 SDK 形态）：
+		// 2026-10-30 国际版 5.9.4 真机 /v2/chat/busy = `workbuddy-ai/5.9.4 workbuddy-ai/
+		// 5.9.4 CLI/2.165.0`，而同一会话的 /v2/chat/completions 首段是驼峰 WorkBuddy。
+		// CN 下两者同值（品牌段本来就是驼峰），故只有 GL 会分叉。
+		req.Header.Set("Accept", "application/json, text/plain, */*")
 		req.Header.Set("Content-Type", "application/json")
-		c.ChatHeaders(req, a, "", ChatMeta{})
-		data, err := c.doJSON(req)
+		req.Header.Set("User-Agent", c.rpcUAFor(a))
+		req.Header.Set("X-Request-ID", session.NewTraceID()) // 真机为纯随机 32 hex（无时间前缀）
+		req.Header.Set("X-Product", "SaaS")
+		if at := a.AccessTokenValue(); at != "" {
+			req.Header.Set("Authorization", "Bearer "+at)
+		}
+		if a.UID != "" {
+			req.Header.Set("X-User-Id", a.UID)
+		}
+		req.Header.Set("X-Domain", c.chatHost(a))
+		data, err := c.doJSON(req, a)
 		if err != nil {
+			var ue *Error
+			if c.globalOn(a) && errors.As(err, &ue) && ue.Kind == ErrNotFound {
+				c.modelBusyUnsupported.Store(true)
+				log.Printf("model busy: global realm 无 /v2/chat/busy（404），本进程后续跳过繁忙度探测")
+				return out, nil
+			}
 			return out, err
 		}
 		var rows []struct {

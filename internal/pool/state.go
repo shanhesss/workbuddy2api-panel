@@ -276,8 +276,20 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	}
 	const alpha = 0.3
 	prev, seen := e.modelCost[model]
+	// 窗口用量（issue #112）：跨窗口重置后累加本次 token。单价是 EMA、用量是累计，
+	// 分字段存放——混在一处会把两者都算错。调度关闭（window<=0）时干脆不记账。
+	nowTS := time.Now()
+	var winStart time.Time
+	var winTokens int64
+	if p.balanceWindow > 0 {
+		winStart, winTokens = prev.WinStart, prev.WinTokens
+		if winStart.IsZero() || nowTS.Sub(winStart) >= p.balanceWindow {
+			winStart, winTokens = nowTS, 0
+		}
+		winTokens += int64(tokens)
+	}
 	if !seen {
-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1, CreditVerified: true}
+		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: nowTS, Samples: 1, CreditVerified: true, WinStart: winStart, WinTokens: winTokens}
 	} else {
 		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
 		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
@@ -286,9 +298,11 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		}
 		e.modelCost[model] = modelCostEntry{
 			CostPer1k:      prev.CostPer1k*(1-alpha) + per1k*alpha,
-			LastSeen:       time.Now(),
+			LastSeen:       nowTS,
 			Samples:        prev.Samples + 1,
 			CreditVerified: true,
+			WinStart:       winStart,
+			WinTokens:      winTokens,
 		}
 	}
 	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
@@ -760,6 +774,32 @@ func (p *Pool) ServableForRealm(realm string) bool {
 	return false
 }
 
+// SlotWaitForRealm 报告「此刻选不到号**只是**因为号都在途占满」：本域存在对该模型
+// 健康（未冷却/未停牌/未手动关闭）的账号，只是名额已满。这与「号在冷却」不同——
+// 后者要等到已知的解封时刻，前者只要有一个在途请求收尾就好，通常几十毫秒到几秒。
+// 调用方据此决定「等一个名额」还是直接 503（issue #117：两号池里一号撞 6004 锁模型后
+// 只剩 3 个名额，第 4 个并发请求必然 503，而它只差几百毫秒就有名额）。
+//
+// 只看 in-flight：health 成立与否由 healthyForModel 判（已含 disabled/paused/手动停牌/
+// 模型冷却）。积分保底/保留积分挡住的号返回 false —— 等下去不会变好，不该让请求干耗。
+func (p *Pool) SlotWaitForRealm(model, realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if p.inFlightFull(e) && !p.reserveBlocked(e, p.modelFreeOf(e, model)) {
+			return true
+		}
+	}
+	return false
+}
+
 // List 返回所有账号状态（按 UID 排序，稳定输出）。
 func (p *Pool) List() []Status {
 	p.mu.RLock()
@@ -888,6 +928,7 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 			CostPer1k: mc.CostPer1k,
 			LastSeen:  mc.LastSeen,
 			Samples:   mc.Samples,
+			WinTokens: e.windowTokens(m, p.balanceWindow, now),
 		})
 	}
 	return rows

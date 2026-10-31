@@ -46,28 +46,38 @@ const (
 	// （install-manifest.json 的 appVersion + /v2/report body 的 commit/releaseDate）。
 	// 与面板自身 client_version 分开：/v2/report 是「桌面端行为」指纹，应恒为桌面端版本。
 	//
-	// **按 realm 分开**（2026-10-20 双版本抓包实测）：两版上报的版本三元组不同，
+	// **按 realm 分开**（2026-10-30 双版本抓包实测）：两版上报的版本三元组不同，
 	// 且 commit/releaseDate 是打包期常量、无法从版本号推导：
 	//
-	//	CN 5.8.3    ideVersion 5.8.3 commit db0e9b51b7fa… releaseDate 1792029498676
-	//	global 5.8.4 ideVersion 5.8.4 commit 73952edb48da… releaseDate 1792063084107
+	//	CN 5.9.3     ideVersion 5.9.3 commit d4692421… releaseDate 1793093056315
+	//	global 5.9.4 ideVersion 5.9.4 commit fa0a0901… releaseDate 1793288804029
+	//
+	// CN 三元组在 2026-10-28 按 5.9.3 真机 /v2/report 重新采集（commit / releaseDate /
+	// ideVersion / extVersion 逐字取自 7 条上报事件，与分发包 cli/product.json 的
+	// commit + date 交叉一致）：
+	//   commit      = d46924219e79332f49c37ccebf27292f87001b19
+	//   releaseDate = 1793093056315
 	//
 	// 此前不分档、恒用 global 的三元组，等于给每个国内号都盖了国际版的包指纹
 	// （版本号与安装清单自相矛盾），是最容易被设备侧写识破的一处。
-	desktopVersionCN         = "5.8.3"
-	desktopCommitCN          = "db0e9b51b7fa0b383f41f5b0b83dd442c8557918"
-	desktopReleaseDateCN     = int64(1792029498676)
-	desktopVersionGlobal     = "5.8.4"
-	desktopCommitGlobal      = "73952edb48da46bd0b244661efe22f4f247c4977"
-	desktopReleaseDateGlobal = int64(1792063084107)
+	desktopVersionCN         = "5.9.3"
+	desktopCommitCN          = "d46924219e79332f49c37ccebf27292f87001b19"
+	desktopReleaseDateCN     = int64(1793093056315)
+	// global 三元组按 5.9.4 国际分发包重采（2026-10-30 拆包）：
+	//   cli/product.json commit = fa0a0901906addaa1a4259f6df347388a5563ded
+	//   cli/product.json date   = 2026-10-29T15:46:44.029Z → 1793288804029
+	//   真机 /v2/update?platform=workbuddy-win32-x64-user&version=5.9.4 与 UA 段一致。
+	desktopVersionGlobal     = "5.9.4"
+	desktopCommitGlobal      = "fa0a0901906addaa1a4259f6df347388a5563ded"
+	desktopReleaseDateGlobal = int64(1793288804029)
 )
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
 
 // desktopUAFor 桌面端 UA：两段品牌一致（与业务链路同源，都是 SDK 的 buildUserAgent）。
-// CN → `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`；
-// global → `workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`。
+// CN 5.9.3 → `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`（真机实测）；
+// global 5.9.4 → `workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0`（真机实测）。
 func desktopUAFor(a *auth.Auth) string {
 	ver, _, _ := desktopTriple(a)
 	brand := uaBrandFor(a)
@@ -177,6 +187,16 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	// X-Requested-With：**不发**。
+	//
+	// 2026-10-30 双版本真机复核（国际 5.9.4 37 条 + 国内 5.9.3 多条 /v2/report，
+	// 按 UA 分成两族）：
+	//
+	//	workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/…   ← 本函数发的就是这一族，**无** X-Requested-With
+	//	WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/…      ← 渲染器侧另一条上报，带 X-Requested-With
+	//
+	// 旧实现在 UA 取「RPC 族」的同时又补了 X-Requested-With，等于把两族的头各取一半
+	// 拼成第三族——两族都不像，比少一个头更显眼。
 	req.Header.Set("User-Agent", desktopUAFor(a))
 	// X-Domain 是**主机名**不是 URL：真机实测 `X-Domain: www.workbuddy.ai`，
 	// 而 desktopBase 返回的是带 scheme 的 base，直接塞进去会发成
@@ -188,7 +208,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }
 
@@ -287,7 +307,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }
 
@@ -356,7 +376,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }
 
@@ -414,24 +434,6 @@ func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName s
 	return events
 }
 
-// DesktopDesignCanvasSequence 构造「设计创意画布」事件组（实测 create_canvas 计数）：
-// wbx_design_canvas_task_create + wbx_design_canvas_open（Ardot create_design 工具
-// 完成时客户端经 metrics 通道上报，同一 /v2/report 端点）。三账号实测 1/1 点亮。
-func DesktopDesignCanvasSequence(conversationID, requestID string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-canvas", "fast-model", "fast-model")
-	return append(events,
-		DesktopEvent{
-			"eventCode": "wbx_design_canvas_task_create", "conversationId": conversationID,
-			"requestId": requestID, "source": "summon_keyword", "cost": 12000, "isSuccessful": true,
-		},
-		DesktopEvent{
-			"eventCode": "wbx_design_canvas_open", "conversationId": conversationID,
-			"requestId": requestID, "id": "ardot-file-" + requestID[len(requestID)-8:],
-			"source": "summon_keyword", "type": "page", "cost": 13000, "isSuccessful": true,
-		},
-	)
-}
-
 // MarketExpert 专家市场的单个专家（/portal/operation-platform/market/expert/list 响应子集）。
 type MarketExpert struct {
 	ExpertID      string `json:"expert_id"`
@@ -486,7 +488,7 @@ func (c *Client) marketExpertList(a *auth.Auth, body map[string]any) ([]MarketEx
 	var out struct {
 		Experts []MarketExpert `json:"experts"`
 	}
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return nil, err
 	}
@@ -542,7 +544,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 			fmt.Printf("[dbg] %s: %s\n", k, req.Header.Get(k))
 		}
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return "", "", err
 	}

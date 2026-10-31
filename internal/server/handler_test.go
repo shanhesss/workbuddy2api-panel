@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -243,13 +244,18 @@ func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 	}
 }
 
-// TestChatQueueFullFailsFastWithoutPenalty 上游 429 + code 6021「queue.full.title」
-// 是渠道级准入队列满（上游容量信号），不是账号问题。2026-10-15 实案：按 ErrSoftRate
-// 处置会逐号软冷却，与全冷却兜底互相喂（兜底把冷却号再送上游，再撞 6021 又续订），
-// 几秒的排队放大成整段时间全量 429（本仓当日 18 次全落 soft_rate）。端到端断言：
-// 不轮转（只打一次上游）、直接回 503 + upstream_busy + 上游原文在场、
-// Retry-After 本地兜底 5s、账号零惩罚。
-func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
+// TestChatQueueBusyRotatesThen429WithoutPenalty 上游 429 + code 6020/6021
+// 「渠道级排队/容量满载」是上游容量信号，不是账号问题。2026-10-15 实案的教训
+// 保留：罚号（ErrSoftRate 处置）会逐号软冷却、与全冷却兜底互相喂，几秒的排队
+// 放大成整段时间全量 429——所以**零惩罚**不变。2026-10-28 生产实案修正两点：
+//   - 恢复请求内轮转：排队可用性间歇（同一分钟内既有 6021 也有成功），一次性
+//     fail-fast 把抖动直接交给客户端；
+//   - 末端回 429 + Retry-After 而非 503：上游本身回 429，WorkBuddy CLI 对 429
+//     按 Retry-After 自动重试、对 503 直接中断任务。
+//
+// 端到端断言：轮转打满两个号（各一次）、429 + Retry-After 本地兜底 5s、
+// 上游原文在场、账号零惩罚。
+func TestChatQueueBusyRotatesThen429WithoutPenalty(t *testing.T) {
 	const upstreamBody = `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea3a771e835e388328713d47cf"}`
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -265,22 +271,43 @@ func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s (want 503 fail-fast，非 429)", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s (want 429，轮转耗尽后的可重试语义，非 503)", rec.Code, rec.Body)
 	}
 	if !strings.Contains(rec.Body.String(), "6021") || !strings.Contains(rec.Body.String(), "b1bc87ea") {
-		t.Errorf("503 body 应透传上游原文（含 code+requestId）: %s", rec.Body)
+		t.Errorf("429 body 应透传上游原文（含 code+requestId）: %s", rec.Body)
 	}
 	if ra := rec.Header().Get("Retry-After"); ra != "5" {
 		t.Errorf("Retry-After=%q want 5（上游未给重置口径时的本地兜底）", ra)
 	}
-	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 0 {
-		t.Errorf("calls=%v want 只打一次上游、busy2 号 0 次（不轮转）", calls)
+	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 1 {
+		t.Errorf("calls=%v want 两号各一次（轮转、tried 不重复选号）", calls)
 	}
 	// 账号完好：无冷却、无禁用、无熔断计数、无 errTotal（ErrSoftRate 会冷却+喂 streak）。
 	st, _ := p.Status("busy1")
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 || st.SoftStreak != 0 {
 		t.Errorf("ErrUpstreamBusy must not penalize account: %+v", st)
+	}
+}
+
+// TestChatQueueWaitingRetryAfterFromBody 6020「queue.waiting」的重试口径在 body
+// （data.retry_after=40，实测真机形态：头侧无 Retry-After），末端 429 的 Retry-After
+// 必须取到 40 而不是本地兜底 5——WorkBuddy CLI 把该头当「睡多久」的指令执行，
+// 差 35s 直接决定客户端的排队节奏是否与上游一致。
+func TestChatQueueWaitingRetryAfterFromBody(t *testing.T) {
+	const upstreamBody = `{"code":6020,"msg":"queue.waiting.title","requestId":"01a181ca3b67934d01c3f64599c8490c","data":{"queue_position":2502,"queue_size":"999+","retry_after":40,"estimated_wait":12510}}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, upstreamBody, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "q1", AccessToken: "at-q1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d want 429 (body=%s)", rec.Code, rec.Body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "40" {
+		t.Errorf("Retry-After=%q want 40（data.retry_after 透传，非本地兜底）", ra)
 	}
 }
 
@@ -429,8 +456,88 @@ func TestChatSyncEmptyUpstreamBodyIs502(t *testing.T) {
 	}
 }
 
+// ctxBlockingReader 阻塞到 ctx 取消再返回 ctx.Err()：模拟「上游正文还在流、客户端先断开」。
+type ctxBlockingReader struct{ ctx context.Context }
+
+func (r ctxBlockingReader) Read([]byte) (int, error) {
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+// TestChatSyncClientCancelIsNotUpstreamParse 钉住客户端断开的分支：上游正文流到一半、
+// 客户端先掐断（AsyncOpenAI 类客户端常见 timeout=15s / 用户点停止）时，不再记
+// 502 upstream_parse —— 上游当时在正常输出，网关没出错。线上一天 11 次这类 502，
+// 全部恰好 total=15.0s、tok=-、do=1.4~2.9s，被统计成了账号故障。
+// 断言三件事：不写响应体（连接已关）、错误汇总归到「客户端中断」而非解析失败、handler 不卡死。
+func TestChatSyncClientCancelIsNotUpstreamParse(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	var once sync.Once
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			once.Do(func() { close(entered) })
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(ctxBlockingReader{ctx}),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":false,"messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	var buf strings.Builder
+	old := log.Writer()
+	log.SetOutput(&buf) // 进程级全局，本测试不 t.Parallel
+	done := make(chan struct{})
+	go func() { h.ServeHTTP(rec, req); close(done) }()
+	<-entered
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.SetOutput(old)
+		t.Fatal("handler 未在 ctx 取消后返回（卡在读上游）")
+	}
+	log.SetOutput(old)
+	if rec.Body.Len() != 0 {
+		t.Fatalf("客户端已断开，不该还写响应体: %s", rec.Body.String())
+	}
+	out := buf.String()
+	if strings.Contains(out, "upstream parse failed") {
+		t.Fatalf("客户端断开不该记成上游解析失败: %s", out)
+	}
+	if !strings.Contains(out, "调用方断开") {
+		t.Fatalf("应落一条调用方断开的日志: %s", out)
+	}
+	if !strings.Contains(out, "EdgeOne") {
+		t.Fatalf("日志应点出 CDN 回源超时这条真实成因: %s", out)
+	}
+	// 该行的 "context canceled" 由错误汇总归为 info 级「客户端中断」（规则见
+	// internal/panel/errors.go:80，errors_test.go 已钉住），这里只确认原文没丢。
+	if !strings.Contains(out, "context canceled") {
+		t.Fatalf("断开原因原文应留在日志里，才能被错误汇总归类: %s", out)
+	}
+}
+
 func TestChatStreamPassthrough(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		// 首帧必须落在**首 token 计时开始之后**：tokensPerSecond 用
+		// (端到端 - TTFB) 作分母，而 TTFB<=0 被定义为「没有观测」→ 不报速率
+		// （handler.go tokensPerSecond 的 ttfb<=0 分支）。
+		//
+		// fake 的 body 是内存 strings.Reader，读首帧几乎零耗时；Windows 的
+		// time.Now() 粒度约 0.5~1ms，两次调用落进同一 tick 时 TTFB 恰好为 0，
+		// 于是 -count=N 或 CI 上偶发 LastTokensPerSecond=nil（本机 30 次复现 11 次、
+		// 与本次改动无关的既有 flake）。显式睡过时钟粒度，让 TTFB 恒 >0。
+		time.Sleep(2 * time.Millisecond)
 		return 200, sseOK, true
 	})
 	h := NewHandler(Config{
@@ -606,13 +713,9 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
 		t.Errorf("calls=%v want bad/good 各 1 次", calls)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
-	}
-	// 冷却时长取自注入的 SoftCooldown，不依赖真实等待。
-	if max := int64(soft / time.Second); st.CoolRemaining <= 0 || st.CoolRemaining > max {
-		t.Errorf("cool_remaining_sec=%d want in (0,%d]", st.CoolRemaining, max)
+	assertModelCooling(t, p, "bad", "glm-5.2", soft)
+	if p.PickByUIDForModel("bad", "deepseek-v4.1-flash") == nil {
+		t.Fatal("模型侧限流不得阻断同账号的其他模型")
 	}
 
 	// 冷却生效：同一账号在冷却期内不得再被选中。
@@ -746,13 +849,7 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
-	}
-	if st.CoolRemaining <= 599 || st.CoolRemaining > 600 {
-		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600", st.CoolRemaining)
-	}
+	assertModelCooling(t, p, "bad", "glm-5.2", 600*time.Second)
 }
 
 // TestChatStickyFollowsFinalSuccess 端到端验证 D4：粘性号失败换号成功后，会话绑定收敛到成功号。
@@ -1858,8 +1955,66 @@ func TestStatusRequiresAuth(t *testing.T) {
 	}
 }
 
-// TestContentBlockedTriggersDegradedRetry passthrough 模式下首请求 400（11128 文案）
-// → 降级重试（Degraded）→ 200，客户端无感。验证第二次出站 body 为 Degraded。
+// TestContentBlockedSplitSystemFirst 11-128 的首选抢救是「拆句留在 system」：
+// 多句 system 被拆成多条 system 消息重试，**不搬到 user**（承载通道不变）。
+// 单句 system 拆不动时才走搬家（见 TestContentBlockedTriggersDegradedRetry）。
+func TestContentBlockedSplitSystemFirst(t *testing.T) {
+	var bodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			if len(bodies) == 1 {
+				return &http.Response{
+					StatusCode: 400,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"code":11-128,"msg":"blocked by security policy"}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	const sys = "Fingerprint sentence one here. Fingerprint sentence two here."
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"`+sys+`"},{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls, got %d", len(bodies))
+	}
+	var second map[string]any
+	if err := json.Unmarshal(bodies[1], &second); err != nil {
+		t.Fatalf("second body json: %v", err)
+	}
+	msgs := second["messages"].([]any)
+	// 拆成两条 system + 原 user；全文仍在 system 里，user 未被塞入 system 原文。
+	if len(msgs) != 3 {
+		t.Fatalf("want 3 条消息（2 system + 1 user），got %d: %v", len(msgs), msgs)
+	}
+	for i := 0; i < 2; i++ {
+		if role := msgs[i].(map[string]any)["role"]; role != "system" {
+			t.Errorf("第 %d 条应为 system: %v", i, role)
+		}
+	}
+	if got := msgs[2].(map[string]any)["content"]; got != "hi" {
+		t.Errorf("user 被动了: %v", got)
+	}
+}
+
+// TestContentBlockedTriggersDegradedRetry 单句 system 拆不动 → 走搬家：
+// passthrough 模式下首请求 400（11-128 文案）→ 重试 → 200，客户端无感。
+// 断言第二次出站的 system 是 Degraded 中性句、system 原文进了首条 user。
 func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	// 记录每次出站请求体，断言第二次为 Degraded 文本。
 	var bodies [][]byte

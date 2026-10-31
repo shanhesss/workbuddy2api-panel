@@ -1,75 +1,16 @@
-// blackcat.go 夜猫子任务（black_cat）+ 新手礼包领取 API。
+// streak_extras.go 新手礼包 / 连登 heatmap / 补签卡 API（growth / billing 域的增补接口）。
 //
-// 判据（WorkBuddy-Daily 项目实测口径 + 本网关验证）：black_cat 要求在
-// **23:00–08:00（CST）窗口内**完成 3 次 glm-5.2 对话并上报 chat 事件链；
-// 窗口外行为不计分。真实对话走网关既有 ChatStream（glm-5.2），事件链用
-// ReportChatActivityModel（chat_5 同款上报形状）。
+// 原 blackcat.go：夜猫子 black_cat 已从上游下架，任务链与排程一并删除。
 package upstream
 
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
-	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
-	"github.com/misakano7545/workbuddy2api-panel/internal/session"
-	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
 )
-
-// InNightWindow 当前是否处于夜猫子计数窗口（23:00–08:00 CST：上游按自然日计时）。
-func InNightWindow(now time.Time) bool {
-	h := now.In(cst.Loc).Hour()
-	return h >= 23 || h < 8
-}
-
-// BlackcatNeed 查 black_cat 任务剩余差额（需要再完成几次对话）。
-// 任务不存在返回 0（无可做）；拉取失败返回错误。
-func (c *Client) BlackcatNeed(a *auth.Auth) (int64, error) {
-	tasks, err := c.ListTasks(a)
-	if err != nil {
-		return 0, err
-	}
-	for _, t := range tasks {
-		if t.TaskCode == "black_cat" {
-			if t.Claimed || t.Current >= t.Target {
-				return 0, nil
-			}
-			return t.Target - t.Current, nil
-		}
-	}
-	return 0, nil
-}
-
-// RunNightChats 夜猫子：发 need 次 glm-5.2 真实对话（读干流）并上报事件链。
-// 返回成功次数。对话内容极短（1+1），消耗可忽略。
-func (c *Client) RunNightChats(a *auth.Auth, need int) (int64, error) {
-	var ok int64
-	for i := 0; i < need; i++ {
-		body, _ := json.Marshal(map[string]any{
-			"model":    "glm-5.2",
-			"messages": []map[string]any{{"role": "user", "content": "1+1等于几？直接回答。"}},
-			"stream":   true,
-		})
-		rc, status, respBody, err := c.ChatStream(a, body, "", ChatMeta{})
-		if err != nil || status >= 400 {
-			if rc != nil {
-				rc.Close()
-			}
-			return ok, fmt.Errorf("第 %d 次对话失败: http=%d err=%v body=%.120s", i+1, status, err, respBody)
-		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(rc, 1<<20))
-		rc.Close()
-		if err := c.ReportChatActivityModel(a, session.NewConversationID(), "", "glm-5.2", "GLM-5.2"); err != nil {
-			return ok, fmt.Errorf("第 %d 次上报失败: %w", i+1, err)
-		}
-		ok++
-		time.Sleep(4 * time.Second)
-	}
-	return ok, nil
-}
 
 // ClaimGift 领取新手礼包（每号一次，已领返回业务错误）。
 func (c *Client) ClaimGift(a *auth.Auth) (int64, error) {

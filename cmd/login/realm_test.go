@@ -111,8 +111,8 @@ func TestRunURLDecoratesAuthURL(t *testing.T) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/state") {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
-		if got := r.URL.Query().Get("platform"); got != "CLI" {
-			t.Errorf("platform=%q want CLI", got)
+		if got := r.URL.Query().Get("platform"); got != "workbuddy-ai" {
+			t.Errorf("platform=%q want workbuddy-ai（intl 站点真机口径）", got)
 		}
 		// 授权 URL 用测试服务器自身地址，便于断言参数。
 		base := "http://" + r.Host
@@ -134,8 +134,9 @@ func TestRunURLDecoratesAuthURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("解析授权 URL 失败 %q: %v", got, err)
 	}
-	if v := u.Query().Get("version"); v != loginsite.ClientVersion {
-		t.Errorf("授权 URL 缺 version（或值不符）：%q", got)
+	// 授权 URL 不再补 version（授权页 bundle 只读 platform/fromSource）。
+	if v := u.Query().Get("version"); v != "" {
+		t.Errorf("授权 URL 不该带 version：%q", got)
 	}
 	if s := u.Query().Get("state"); s != "st-1" {
 		t.Errorf("state=%q want st-1", s)

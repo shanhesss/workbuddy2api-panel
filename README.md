@@ -68,7 +68,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 🔄 **多账号池** | 快过期积分加权 + 成本分层 + 加权随机选号，Top-5 候选 + 防惊群 |
 | 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流 |
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
-| ⏰ **定时任务** | 签到（09/21 点，末尾自动跑**连登管家**：兑换已解锁档位 + 抽完抽奖次数）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点）+ **成长任务队列**（11 点，自动跑一遍任务中心待办），各类独立开关 |
+| ⏰ **定时任务** | 签到（09/21 点，末尾自动跑**连登管家**：兑换已解锁档位 + 抽完抽奖次数）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检；国际号另跑**网页会话腿**，见下）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点）+ **成长任务队列**（11 点，自动跑一遍任务中心待办），各类独立开关 |
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动对齐到模型支持的**最近档**（同距优先模型默认档，行里显示生效档位）；网关侧 `thinking.*` 档位策略（客户端优先 / 网关优先 + 作用域「只档位 / 档位与开关」，含按模型覆盖、`off` 尊重与保存后热生效） |
 | 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
@@ -76,6 +76,44 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题），账号运维 / 模型档位查询 / 在线改配置（热生效）/ 运行日志 / 积分任务，见 [Web 管理面板](#-web-管理面板) |
+
+## 代理池与账号绑定
+
+面板「代理池」支持一行一个批量添加，接受 `http`、`https`、`socks5`、`socks5h` URL，包括用户名密码。空行忽略，重复项跳过，无效行单独报告，其他有效行仍保存。例如：
+
+```text
+http://user:password@127.0.0.1:8080
+https://127.0.0.1:8443
+socks5://user:password@127.0.0.1:1080
+socks5h://127.0.0.1:1081
+```
+
+账号池每行的代理菜单保存后立即生效：
+
+| 模式 | 出站行为 |
+|---|---|
+| 默认随机 | 每个 HTTP 请求独立从可用节点中随机选择；该请求的重定向和响应流保持同一节点 |
+| 直连 | 使用原有直连传输 |
+| 固定代理 | 只用绑定节点；节点故障时保留绑定并返回代理错误 |
+
+池为空时默认随机使用直连。池中已有节点但没有可用节点时返回错误。代理故障不处罚账号，不触发额外换号重试。聊天、图片、搜索、嵌入、token 刷新、余额和账号后台任务使用同一账号路由入口。未关联账号的 OAuth 授权与更新下载沿用原出站行为。
+
+HTTP/HTTPS 使用标准代理传输；`socks5` 在本机解析目标域名，`socks5h` 由代理解析。各节点复用独立连接池，沿用现有 DNS、TLS、响应头超时和流式空闲控制。禁用或删除只关闭空闲连接，在途请求继续完成。
+
+自动测活默认每 60 秒运行，单次超时 10 秒，最多 8 个节点并发。默认检测 `https://www.workbuddy.cn/`，最终响应为 2xx/3xx 即成功。新增节点与重启后的节点先检测，首次成功后进入候选；连续失败 3 次自动禁用，之后连续成功 2 次恢复。面板可修改 URL、间隔、超时与阈值，也可单独或全部检测。手动禁用优先，检测成功仍保持禁用。业务限流、余额不足等响应不影响测活状态。
+
+节点、手动启停、账号绑定与测活设置原子保存到 `state_file` 同目录的 `proxy-pool.json`，健康状态仅保存在内存。代理列表、接口响应和错误日志不返回密码；编辑时密码留空保持原值，从 URL 删除用户名可移除认证。被账号绑定的节点禁止删除（HTTP 409），需先解除绑定；从面板删除账号时同步清理绑定。
+
+管理接口沿用面板鉴权：
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET / POST | `/panel/api/proxies` | 列表与批量添加（`{"lines":"..."}`） |
+| PATCH / DELETE | `/panel/api/proxies/{id}` | 编辑（`name`、`url`、`password`、`enabled`）与删除 |
+| POST | `/panel/api/proxies/{id}/check` | 排队检测单个节点 |
+| POST | `/panel/api/proxies/check` | 排队检测所有节点 |
+| PUT | `/panel/api/proxies/health` | 保存 `url`、`interval_seconds`、`timeout_seconds`、`failure_threshold`、`success_threshold` |
+| PUT | `/panel/api/accounts/{uid}/proxy` | 保存 `{"mode":"random"}`、`{"mode":"direct"}` 或 `{"mode":"fixed","proxy_id":"..."}` |
 
 ## 🎯 成长任务一键完成（17/18）
 
@@ -143,10 +181,11 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；JSONL 只归档请求元数据，不写提示词、响应正文或凭证。请求记录表带**调用来源**（客户端 IP / User-Agent，按 `logging.request_client_info` 可关），支持按 IP / UA / 模型 / 账号 / 请求 ID 与结果筛选 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
 | **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
-| **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
+| **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **25 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 专家召唤 / 技能尝鲜 / 主题 / 资料库等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
 | **模型繁忙度（面板）** | 「模型与档位」列出官方 `/v2/chat/busy` 的实时繁忙度（idle/normal/busy/congested/unavailable），只在 `繁忙 / 拥堵 / 不可用` 时挂色标——它解释了 chat 侧偶发的 429 / 6021 queue.full。**只读观测**：不参与选号；服务端偶发对整批回 `unknown`（实测同批重查可在 idle/unknown 间跳），故取不到就不标；同页每行另有**网关档位**下拉（首项＝模型支持的最高档，其余为具体档与 `off`；写入 `thinking.model_defaults` 精确键、保存即热生效，策略关闭时整体禁用并显示生效档）与**下游可见**开关（与 `models.hidden` 同一份黑名单：关掉的模型从 `/v1/models` 隐藏、点名调用被拒，行尾置灰并排到列表末尾） |
 | **联网检索（官方 agenttool）** | `POST /v1/search` 透传官方 `{base}/agenttool/v1/search`（`{query,max_results}` → `{results[].title/url/snippet/date,total_results}`，查询免费；对 DSH（DeepSeek Harness，按 UA 含 `deepseek-harness` 识别）额外启用 DeepSeek Search API 兼容：接受 `count` 作为条数，`date` 缺失时补 `null`、`title`/`snippet` 缺失时补空串；其余客户端保持上游原文逐字节透传）；同一 base 还提供 `POST /v1/fetch`（`{"url":"https://…"}` → `{"content":"<markdown>"}`，透传官方 `agenttool/v1/webfetch`）；加 `"deep":true` 则改走官方**综述式**检索 `agentic_search`（服务端多轮检索 + 抓页 + 带引用综述，回 `done` 帧原文：`synthesis.content` + `results` 整页正文 + `statuses` + `partial` 降级标记）——实测单次 18~66s、prompt ~48K tokens，故默认走 snippet 快路径（~1s）。另在 `/v1/messages` 与 `/v1/responses` 上落地服务端联网工具：客户端（Claude Code / Codex）只声明 `{"type":"web_search_20250305","name":"web_search"}`（或 Responses 的托管 `{"type":"web_search"}`），网关侧先让模型自己写检索词（探测）、执行检索、把结果注入上下文，再走既有流式管道出答案。Anthropic 侧按协议回报 `server_tool_use` + `web_search_tool_result` 块（含来源 URL，且**不**降级成客户端可执行的 `tool_use`）；没声明该工具的请求零额外开销；检索失败如实告知模型（不静默当成「网上没有」），联网不可用则降级为普通对话 |
 | **成长任务队列每日排程** | `schedule.growth_hours`（默认 `[11]`）+ `schedule.growth_enabled`：面板任务中心的执行队列按排程每日自动跑一遍（扫描待办 → accept → 动作 → 达标领奖），与手动入口共用同一队列与账号锁；`POST /admin/tasks/growth/run` 可手动补跑 |
+| **国际版每日活跃（网页通道）** | 国际版每日 30/50 积分只认「**跑完的网页 agent 会话**」——桌面身分 chat/completions 与 `/v2/report` 只点亮连登，积分不动（issue #111 实测）。排程的国际版活跃腿因此完整复刻网页端链路：`POST /console/as/conversations/` 建会话 → `GET .../{id}/session` 取沙箱 `link`/`token` → ACP over SSE（`initialize` → `session/load` → `session/set_model` → `session/prompt`）→ 轮询 `data.status` 到 `completed` → `stop`（失败再 `delete`）。三个必须照抄客户端的细节：ACP 鉴权用**沙箱 token**（账号 token 一律 401 `12801`）、走浏览器身份 UA/Origin、跑完必须收尾（单号活跃会话上限 10 条，漏收尾攒满就再也建不出会话）。模型钉 `deepseek-v4.1-flash`（国际版 x0.00，打卡不扣积分）；当日成功一次后不再重复建会话。国内版零调用 |
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，积分冷却（余额耗尽）账号余额恢复自动解冻 |
@@ -156,6 +195,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **保留积分** | `pool.reserve_credits`（缺省 10）设最低余额：余额**已知**且低于该值的账号停止接单，面板账号行显示「保留积分」标记，避免余额被用到 0 触发上游提醒短信；仍留在池中照常签到/猫猫旅行，充值后自动恢复。`0` = 关闭 |
 | **用量页积分历史** | 用量视图新增「积分与 token 按小时」表：每小时列出请求数 / prompt / completion / 合计 token / **扣费积分** / 兑换率（1 积分换多少 token，倒序，最近一小时在最上面），卡片另给窗口内积分合计与兑换率。积分取上游末帧 `usage.credit`，**未观测到的请求不计**（「没测到」≠「没花钱」）；随小时桶一起折叠进日桶，保留 90 天；另给窗口内**总积分**卡片（`usage.credit` 求和，无样本时显示 —） |
 | **模型能力透出** | `/v1/models` 附带 `context_length` / `max_output_tokens` / 工具·视觉·思考能力标记 / 积分倍率等上游真实字段，并声明 `reasoning_supported_efforts` / `reasoning_default_effort`：默认档按 `thinking.*` 策略写成网关**实际生效档**（策略关闭时忠于上游），`can_disable_thinking` 的模型在档位表里追加 `off`，目录只给固定档的模型声明为单档 |
+| **models.dev 形状能力声明** | 上一条之外，`/v1/models` 每条再**追加**一组 models.dev 词表字段，给只认这套词的客户端（magpie 等）读：`modalities`（`input` 按 `supports_images` 给 `["text"]` 或 `["text","image"]`；`output` 对话模型恒 `["text"]`、出图模型 `["image"]`）、`limit`（`context`/`output` 直接搬同一轮的 `context_length`/`max_output_tokens`，缺哪个省哪个，**不拿 1M/131072 兜底**）、`tool_call`、`reasoning`、`reasoning_options`（档位取 `reasoning_supported_efforts` 去掉 `off`；有 `off` 或 `can_disable_thinking` 时补 `{"type":"toggle"}`）。**纯追加**：既有键一个字节都不改（`cn:` 前缀、`object`、`created`、`owned_by` 照旧），无数据源的字段（`cost`/`attachment`/`structured_output`/`knowledge`/`release_date`）一律不写——客户端按「字段在不在」判能力，编造比缺失更糟。另加 `supported_reasoning_levels`（`[{"effort":"low"},…]`）：**这是本组里唯一不属于 models.dev 词表的键**，因为 magpie 解析厂商列表时只认它（`internal/catalog/live.go:704` 的 `liveModel.Levels`），「关闭思考」按其 `EffortRank` 写成 `none` 而不是 `off`，出图与无档位模型整键不写。不认这些键的客户端按 JSON 惯例忽略。面板自己的 `/panel/api/models` 不受影响，仍是网关形状 |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 | **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖，见下文） |
