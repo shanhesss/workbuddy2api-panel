@@ -15,7 +15,7 @@ data/
 
 # Config with secrets (use config.example.json)
 config.json
-/config.json.bak
+/config.json.bak*
 API_KEY.txt
 
 # Build artifacts
