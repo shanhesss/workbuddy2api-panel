@@ -155,6 +155,7 @@ func main() {
 	p.SetCreditFloorMaxRate(cfg.Pool.CreditFloorMaxRate) // 保底兜底的目录倍率上限（0 = 严格模式）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetReserveCredits(*cfg.Pool.ReserveCredits) // 保留积分：余额低于阈值停止接单（0 = 关闭，缺省 10）
+	p.SetReserveCreditsByRealm(cfg.Pool.ReserveCreditsByRealm)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring, cfg.ExpiringSoonDur)
 	p.SetAccountPriority(cfg.Pool.AccountPriority) // 账号优先级/占比（issue #62）：空表 = 不启用
 	p.SetAccountShare(cfg.Pool.AccountShare)
@@ -188,6 +189,18 @@ func main() {
 
 	up := upstream.New()
 
+	// 出站 ClientHello 指纹档位：默认 node（复刻官方 Node/OpenSSL 的 JA3/JA4）。
+	// 配 go 才退回 crypto/tls 原生形态——唯一用途是指纹导致握手异常时紧急回滚。
+	if err := up.SetTLSFingerprint(cfg.Upstream.TLSFingerprint); err != nil {
+		log.Fatalf("CONFIG: %v", err)
+	}
+	if up.TLSFingerprint == upstream.TLSFingerprintNode {
+		log.Printf("[upstream] TLS 指纹复刻已启用（JA3 %s / JA4 %s）",
+			upstream.OfficialJA3MD5, upstream.OfficialJA4)
+	} else {
+		log.Printf("[upstream] TLS 指纹为原生 Go 形态（JA3/JA4 与官方客户端不一致）")
+	}
+
 	// 出站 DNS（config dns_servers / WB2A_DNS）：显式指定解析器，绕开系统配置。
 	// 典型场景是 Android（无 /etc/resolv.conf，Go 解析器退回 [::1]:53 全域名失败）
 	// 与本地 DNS 被污染。未配置时保持系统解析器，行为零变化。
@@ -215,9 +228,11 @@ func main() {
 		log.Fatalf("proxy pool: %v", err)
 	}
 	defer proxies.Close()
+	proxies.SetTLSOver(up.TLSOver) // 经代理的 HTTPS 与直连同一指纹、同一请求头顺序
 	up.ProxyPool = proxies
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(cfg.Features.SanitizeBrandScope)
+	up.KeepRecentRounds.Store(int64(cfg.Prompt.KeepRecentRounds))
 	// 思考档位策略（thinking 节）：启动装载，面板保存配置时经 saveConfig 热更新。
 	up.SetEffortPolicy(effortPolicyOf(cfg))
 	if cfg.Thinking.Enabled {
@@ -282,12 +297,13 @@ func main() {
 		// 余额采样记录器：挂在余额刷新之后（scheduler 内），nil = 不采样。
 		Balance: bal,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
-		ExpiringSoonWindow: cfg.ExpiringSoonDur,
-		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:     !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
-		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		ExpiringSoonWindow:  cfg.ExpiringSoonDur,
+		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:      !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
+		WebActivityDisabled: !cfg.Schedule.WebActivityEnabled,
+		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
+		GrowthDisabled:      !cfg.Schedule.GrowthEnabled,
 		// 周期保活只刷新临期凭证（默认 7 天窗口）；面板手动全量保活不受影响。
 		KeepaliveRefreshWindow: cfg.KeepaliveRefreshWindowDur,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
@@ -367,6 +383,7 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		EmbeddingsEnabled:    cfg.Features.EmbeddingsEnabled,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		RecordContext:        cfg.Logging.RequestArchiveContext,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 		// 模型白名单（issue #68）：归一化集合 + 启用标志；空配置 = 不启用。
 		AllowedModels:    allowedModels,
@@ -510,6 +527,7 @@ func main() {
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		RecordContext:    cfg.Logging.RequestArchiveContext,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
@@ -842,6 +860,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		EmbeddingsEnabled:    newCfg.Features.EmbeddingsEnabled,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		RecordContext:        newCfg.Logging.RequestArchiveContext,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 		// 白名单热生效：与 HiddenModels 同一条快照重建通路（issue #68）。
 		AllowedModels:    newAllowedModels,
@@ -857,6 +876,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(newCfg.Features.SanitizeBrandScope)
+	up.KeepRecentRounds.Store(int64(newCfg.Prompt.KeepRecentRounds))
 	// 思考档位策略热生效：改默认档 / 切换客户端优先或作用域后，下一次 chat 即按新策略。
 	up.SetEffortPolicy(effortPolicyOf(newCfg))
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
@@ -872,8 +892,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring, newCfg.ExpiringSoonDur)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.SetKeepaliveRefreshWindow(newCfg.KeepaliveRefreshWindowDur)
-	p.SetReserveCredits(*newCfg.Pool.ReserveCredits)  // 保留积分热生效（0 = 关闭，缺省 10）
-	p.SetAccountPriority(newCfg.Pool.AccountPriority) // 账号优先级/占比热生效（issue #62）
+	p.SetReserveCredits(*newCfg.Pool.ReserveCredits)              // 保留积分热生效（0 = 关闭，缺省 10）
+	p.SetReserveCreditsByRealm(newCfg.Pool.ReserveCreditsByRealm) // 按域覆盖热生效（issue #147）
+	p.SetAccountPriority(newCfg.Pool.AccountPriority)             // 账号优先级/占比热生效（issue #62）
 	p.SetAccountShare(newCfg.Pool.AccountShare)
 	sch.Reconfigure(scheduler.ScheduleParams{
 		CheckinHours:   newCfg.Schedule.CheckinHours,
@@ -885,6 +906,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		CheckinDisabled:        !newCfg.Schedule.CheckinEnabled,
 		TravelDisabled:         !newCfg.Schedule.TravelEnabled,
 		ActivityDisabled:       !newCfg.Schedule.ActivityEnabled,
+		WebActivityDisabled:    !newCfg.Schedule.WebActivityEnabled,
 		KeepaliveDisabled:      !newCfg.Schedule.KeepaliveEnabled,
 		GrowthDisabled:         !newCfg.Schedule.GrowthEnabled,
 		IncludeDisabledInTasks: newCfg.Schedule.IncludeDisabledInTasks,

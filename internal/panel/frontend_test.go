@@ -1467,6 +1467,8 @@ const ctx = {
   renderPackages: (d, limit) => rendered.push([d.stamp, limit]),
   pkDetailLimit: () => 7,
   esc: (s) => String(s),
+  // 下拉框记忆（issue #160）的 localStorage 包装在抽取范围之外，本测试不关心。
+  prefGet: () => '', prefSet: () => {},
 };
 vm.createContext(ctx);
 vm.runInContext("'use strict';\n" + src.slice(start, src.indexOf('const PROXY_STATES', start)) + '\nthis.loadPackages = loadPackages;', ctx);
@@ -1677,8 +1679,12 @@ func TestPanelRemarkWiring(t *testing.T) {
 		// 或保存后别的号备注被清空，而 Go 编译与 JS 语法检查都发现不了。
 		`data-a="remark"`,
 		"if (a === 'remark') { openRemarks(u); return; }",
-		"rows = rows.filter(r => r.uid === k);",
+		"rows = rows.filter(r => r.key === k);",
 		"const map = Object.assign({}, remarksAll());",
+		// 分组（issue #159）：编辑器里的分组输入 + 只提交改动行的 POST 接线。
+		// 少任一处，分组填了保存不上而界面显示成功（备注是本机的，不会跟着报错）。
+		`data-guid="`,
+		`'/group', { method: 'POST', body: JSON.stringify({ group }) }`,
 	} {
 		if !bytes.Contains(js, []byte(want)) {
 			t.Fatalf("app.js 缺少 %s", want)
@@ -1866,6 +1872,7 @@ if (start < 0 || end < 0) throw new Error('expiry snapshot helpers not found');
 const ctx = {
   Number, String, Array, Date, Math, JSON, PK_DAY_MS: 86400000,
   expBody: { innerHTML: '', querySelector: () => null }, expNote: { textContent: '' },
+  expTotalBody: { innerHTML: '' }, expTotalNote: { textContent: '' },
   esc: s => String(s), fmtTok: n => String(n),
   pkExpiryDateTime: ms => new Date(ms).toISOString(),
 };
@@ -1891,19 +1898,38 @@ ctx.renderExpirySnapshot({
     { uid: 'a', nickname: 'A', credits_expiry_buckets: [{ date: day(3), remain: 150 }] },
   ],
 });
-const buckets = { html: ctx.expBody.innerHTML, note: ctx.expNote.textContent };
+const buckets = { html: ctx.expBody.innerHTML, note: ctx.expNote.textContent,
+  tot: ctx.expTotalBody.innerHTML };
 ctx.renderExpirySnapshot({
   accounts: [{ uid: 'c', nickname: 'C',
     credits_earliest_expiry: new Date(Date.now() + 3 * 86400000).toISOString(),
     credits_earliest_remaining: 77 }],
 });
+const fb = ctx.expBody.innerHTML.includes('77');  // 后面还要渲混域快照，先取
+// 跨账号合计（issue #102）：两个号在 day(3) 各自到期 120/150 → 一行 270 / 2 个号；
+// day(5) 只有 B 的 300 → 1 个号。同域不拆，不出现域标签。
+const tot = buckets.tot;
+const rowsOf = html => (html.match(/<tr>/g) || []).length;
+const cellsOf = html => (html.match(/<td/g) || []).length;
+// 混域：同一份快照里 cn 与 global 必须分行合计，不能加成一笔。
+ctx.renderExpirySnapshot({ accounts: [
+  { uid: 'x', realm: 'cn', credits_expiry_buckets: [{ date: day(3), remain: 100 }] },
+  { uid: 'y', realm: 'global', credits_expiry_buckets: [{ date: day(3), remain: 40 }] },
+] });
+const mixed = ctx.expTotalBody.innerHTML;
 process.stdout.write(JSON.stringify({
   order: buckets.html.indexOf('>A<') >= 0 && buckets.html.indexOf('>A<') < buckets.html.indexOf('>B<'),
   hasRest: buckets.html.includes('随后'),
   weekSum: buckets.html.includes('7 天内合计 420'),
   dayLabel: buckets.html.includes('3 天'),
   note: buckets.note,
-  fallback: ctx.expBody.innerHTML.includes('77'),
+  fallback: fb,
+  totRows: rowsOf(tot), totCells: cellsOf(tot),
+  totDay3: tot.includes('>270<') && tot.includes('>2<'), totDay5: tot.includes('>300<'),
+  totNoRealm: !tot.includes('国内版'),
+  mixedRows: rowsOf(mixed), mixedSplit: mixed.includes('100') && mixed.includes('40') &&
+    !mixed.includes('140'),
+  totNote: ctx.expTotalNote.textContent,
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "expiry-snapshot-*.cjs")
 	if err != nil {
@@ -1920,11 +1946,38 @@ process.stdout.write(JSON.stringify({
 	got := strings.TrimSpace(string(out))
 	for _, want := range []string{
 		`"order":true`, `"hasRest":true`, `"weekSum":true`, `"dayLabel":true`, `"fallback":true`,
+		`"totRows":2`, `"totCells":8`, `"totDay3":true`, `"totDay5":true`, `"totNoRealm":true`,
+		`"mixedRows":2`, `"mixedSplit":true`, `"totNote":"2 个到期日"`,
 		`每 5 分钟后台刷新`, `2 个账号有未到期批次`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expiry snapshot 输出缺少 %q: %s", want, got)
 		}
+	}
+}
+
+// TestExpiryTotalCollapsed 跨账号合计必须默认收起：它和按账号的表叠在一起太吵
+// （用户反馈）。<details> 不带 open 才收，写了 open 就等于没做。
+func TestExpiryTotalCollapsed(t *testing.T) {
+	raw, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	m := regexp.MustCompile(`<details([^>]*)>`).FindAllStringSubmatch(string(raw), -1)
+	found := false
+	for _, g := range m {
+		if !strings.Contains(string(raw), "expTotalBody") {
+			continue
+		}
+		if strings.Contains(g[1], "exp-total") {
+			found = true
+			if strings.Contains(g[1], "open") {
+				t.Fatal("跨账号合计的 details 带 open，等于没收起")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("跨账号合计没有包在 <details class=\"exp-total\"> 里")
 	}
 }
 

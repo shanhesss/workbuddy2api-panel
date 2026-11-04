@@ -207,7 +207,7 @@ func TestRoutingRandomFixedDirectAndRedirect(t *testing.T) {
 	defer direct.Close()
 	request := func(uid string) (string, error) {
 		req, _ := http.NewRequest("GET", direct.URL, nil)
-		resp, err := m.Do(&http.Client{Timeout: time.Second}, req, uid)
+		resp, err := m.Do(&http.Client{Timeout: time.Second}, req, uid, "cn")
 		if err != nil {
 			return "", err
 		}
@@ -262,7 +262,7 @@ func TestRoutingRandomFixedDirectAndRedirect(t *testing.T) {
 	}
 	for range 10 {
 		req, _ := http.NewRequest("GET", "http://destination.invalid/redirect", nil)
-		resp, err := m.Do(&http.Client{Timeout: time.Second}, req, "u")
+		resp, err := m.Do(&http.Client{Timeout: time.Second}, req, "u", "cn")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -284,8 +284,10 @@ func TestRoutingRandomFixedDirectAndRedirect(t *testing.T) {
 	if err := m.Update(ids[1], Input{Enabled: &off}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := request("u"); !IsError(err) {
-		t.Fatal("exhausted pool silently used direct")
+	// 全部停用 = 代理池关掉，随机绑定回落直连（issue #150）；fixed 仍须报错——
+	// 显式钉住的代理不可用时静默直连会把本机 IP 泄漏给上游（上面那条已验）。
+	if body, err := request("u"); err != nil || body != "direct" {
+		t.Fatalf("all proxies disabled should fall back to direct: %q %v", body, err)
 	}
 }
 
@@ -297,7 +299,12 @@ func TestProbeConcurrencyBound(t *testing.T) {
 		defer active.Add(-1)
 		for old := peak.Load(); n > old && !peak.CompareAndSwap(old, n); old = peak.Load() {
 		}
-		entered <- struct{}{}
+		// 非阻塞：两次 CheckAll × 24 个节点会产生 48 个请求，但下方只消费 8 个就离开，
+		// 缓冲满了再阻塞发送会让 handler 永远卡住、wg.Wait 挂到 go test 超时（CI 实测）。
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
 		<-release
 		w.WriteHeader(200)
 	}))
@@ -371,7 +378,7 @@ func TestProxyResponseErrorsRetainIdentityAndCancellation(t *testing.T) {
 	id := addProxy(t, m, proxy.URL)
 	probe(t, m, id)
 	req, _ := http.NewRequest("GET", "http://origin.invalid/truncated", nil)
-	resp, err := m.Do(http.DefaultClient, req, "u1")
+	resp, err := m.Do(http.DefaultClient, req, "u1", "cn")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +390,7 @@ func TestProxyResponseErrorsRetainIdentityAndCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	req, _ = http.NewRequestWithContext(ctx, "GET", "http://origin.invalid/", nil)
-	_, err = m.Do(http.DefaultClient, req, "u1")
+	_, err = m.Do(http.DefaultClient, req, "u1", "cn")
 	if !IsError(err) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation lost proxy identity or cause: %v", err)
 	}

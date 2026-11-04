@@ -61,6 +61,14 @@ type Config struct {
 		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
 		// 热生效（经 livecfg 快照），无需重启。
 		RequestClientInfo bool `json:"request_client_info"`
+		// RequestArchiveContext 是否把会话上下文（system + messages / 出图 prompt）记入
+		// 请求事件，面板「请求事件日志」点行展开即可看当轮发出去的内容。缺省 false。
+		//
+		// 为什么默认关：这是**用户提示词**，比 IP 敏感一个量级——开了等于把每次对话的
+		// 原文落到 state 目录的归档文件里（保留 7 天、上限 100MiB）。排查「上游为什么
+		// 拒这条请求」时它是唯一能对上的证据，但那该是运维主动开的临时手段，
+		// 不是默认行为。热生效，无需重启。
+		RequestArchiveContext bool `json:"request_archive_context"`
 	} `json:"logging"`
 
 	Server struct {
@@ -110,6 +118,11 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务队列
+		// WebActivityEnabled 国际版「网页通道」每日活跃腿（issue #111）。**缺省 false**，
+		// 与上面五个「缺省 true」的开关相反：上游实测每日 30 积分由活跃上报本身触发，
+		// 网页会话不是必要条件；这条腿每天要为每个国际号建一条真实会话并占一条活跃
+		// 名额（上限 10），没必要默认开着。显式 true 才跑。
+		WebActivityEnabled bool `json:"web_activity_enabled"`
 
 		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
 		// 余额刷新）对**已禁用（disabled）**的账号也执行。
@@ -204,6 +217,12 @@ type Config struct {
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
+		// TLSFingerprint 出站 ClientHello 指纹档位：
+		//   "node"（缺省）复刻官方 Node/OpenSSL 形态，JA3/JA4 与真机一致；
+		//   "go"   用 crypto/tls 原生形态（排障 / 回滚用）。
+		// 默认 node：不配也走复刻，避免"忘了配就裸奔"。
+		// 选 go 的唯一理由是指纹复刻导致握手异常时紧急回滚。
+		TLSFingerprint string `json:"tls_fingerprint"`
 		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
@@ -306,6 +325,10 @@ type Config struct {
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
 		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
 		File string `json:"file"`
+		// KeepRecentRounds 只保留最近 N 轮对话（issue #99）：出站前丢掉更早的
+		// user/assistant/tool 消息，system 全留。0 = 关闭（全量透传）。
+		// 多轮长对话的输入 token 主要花在这上面；丢的是上下文而不是协议。
+		KeepRecentRounds int `json:"keep_recent_rounds"`
 	} `json:"prompt"`
 
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
@@ -334,9 +357,10 @@ type Config struct {
 		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
 		// 关闭后完全不使用到期信息选号。
 		PreferExpiring bool `json:"prefer_expiring"`
-		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
-		// 此窗口内的批次令账号命中上述 ×3 加权；窗口开大 → 命中账号变多、
+		// ExpiringSoon 快过期积分窗口（如 "720h"=30天）：签到/余额刷新时，到期时间在
+		// 此窗口内的批次令账号命中上述加权；窗口开大 → 命中账号变多、
 		// 偏好被稀释。空/0 = 禁用该加权门槛。
+		// 窗口外的批次完全不参与：账号最早批次在窗口外时即使它最近到期也不加权。
 		ExpiringSoon string `json:"expiring_soon"`
 		// CostExploreInterval costTier 条件探索窗口（issue #136 方案 a′）：tier 0
 		// 垄断层存在且 tier 1 有成员时，距上次探索 ≥ 窗口则本次 pick 生效层切
@@ -354,6 +378,10 @@ type Config struct {
 		// 被用到 0。未配置（键缺席）→ 默认 10；显式写 0 = 关闭；从未查到余额的账号不受影响。
 		// 指针类型用于区分「未配置」（nil → 默认 10）与「显式 0」（关闭）。
 		ReserveCredits *int64 `json:"reserve_credits"`
+		// ReserveCreditsByRealm 按域覆盖上面的阈值（issue #147）：键 "cn"/"global"，
+		// 值为该域阈值（0 = 该域关闭）。场景是国内版留 1000 分养号、国际版只留 350
+		// 分接低流量模型——两域共用一个数值时只能取更严的那个。未写的域用全局值。
+		ReserveCreditsByRealm map[string]int64 `json:"reserve_credits_by_realm"`
 		// AccountPriority / AccountShare 账号级路由偏好（issue #62）。键 = uid（面板账号
 		// 行的短 uid，悬停看完整值）。缺省/空表 = 全部未配置，选号行为与旧版完全一致。
 		//   account_priority: {"<uid>": 1} 小 = 先消耗。配了的号构成「先烧层」，层内号
@@ -525,7 +553,11 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.PreferExpiring = true
-	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	// 快过期窗口默认 30 天。7 天太窄：奖励积分的批次到期日普遍排在 2～4 周后，
+	// 窗口内常常一个号都不命中，加权形同未开（实测三号池最早批次 22/25/27 天后，
+	// credits_expiring 全 0，选号退化成普通加权）。窗口内是相对紧迫度，放宽不会
+	// 让紧迫度失真，只是把「今天到期 vs 四周后到期」也纳入同一条曲线。
+	c.Pool.ExpiringSoon = "720h"
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
 	// 窗口用量调度默认 1h（issue #112：热点号降权，把流量摊给闲置号）；"0" 关停。
@@ -664,6 +696,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
 		c.Upstream.UserAgent = v
 	}
+	if v := os.Getenv("WB2A_TLS_FINGERPRINT"); v != "" {
+		c.Upstream.TLSFingerprint = v
+	}
 	if v := os.Getenv("WB2A_CLIENT_VERSION"); v != "" {
 		c.Upstream.ClientVersion = v
 	}
@@ -797,6 +832,7 @@ func (c *Config) EnvironmentManagedFields() []string {
 		{"WB2A_SOFT_RATE", "cooldown.soft_rate", ""}, {"WB2A_SOFT_RATE_MAX", "cooldown.soft_rate_max", ""},
 		{"WB2A_TIMEOUT_SECONDS", "upstream.timeout_seconds", "int"}, {"WB2A_HEADER_TIMEOUT_SECONDS", "upstream.header_timeout_seconds", "int"},
 		{"WB2A_IDLE_TIMEOUT_SECONDS", "upstream.idle_timeout_seconds", "int"}, {"WB2A_USER_AGENT", "upstream.user_agent", ""},
+		{"WB2A_TLS_FINGERPRINT", "upstream.tls_fingerprint", ""},
 		{"WB2A_CLIENT_VERSION", "upstream.client_version", ""}, {"WB2A_CLI_VERSION", "upstream.cli_version", ""},
 		{"WB2A_CLIENT_NAME", "upstream.client_name", ""}, {"WB2A_DEVICE_TOKEN", "upstream.device_token", ""},
 		{"WB2A_DEVICE_TOKEN_FILE", "upstream.device_token_file", ""}, {"WB2A_PASSTHROUGH_IP", "upstream.passthrough_ip", "bool"},
@@ -1001,6 +1037,17 @@ func (c *Config) normalize() error {
 		c.Pool.ReserveCredits = &v
 	case *c.Pool.ReserveCredits < 0:
 		*c.Pool.ReserveCredits = 0
+	}
+	// 保留积分按域覆盖（issue #147）：非法键剔除，负值归零（0 = 该域关闭）。
+	// 未写的域回落 reserve_credits。删除时不能边遍历边 delete 之外还改值——先收集再改。
+	for k, v := range c.Pool.ReserveCreditsByRealm {
+		if k != "cn" && k != "global" {
+			delete(c.Pool.ReserveCreditsByRealm, k)
+			continue
+		}
+		if v < 0 {
+			c.Pool.ReserveCreditsByRealm[k] = 0
+		}
 	}
 	// 账号优先级/占比（issue #62）：非正值视为「未配置」直接剔除——0 在这里不是有意义的
 	// 配置（不是"最低优先级"，也不是"零占比"），留着会让语义有两种解释。剔除后空表与

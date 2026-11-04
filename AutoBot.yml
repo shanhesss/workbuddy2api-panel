@@ -9,16 +9,12 @@ upstream:
     # 官方客户端行为的对照实现最全的一个：product.json 取值、每类请求的头/体形状、
     # 备用入口与 HTTPDNS、业务码处置都有抓包依据，docs/official-client.md 是现成清单
     - yreidev/workbuddy2api-panel
-    # 上游停维护后最活跃的 fork：面板资源占用优化、.deb/systemd 打包、企业微信推送都出自这里
-    - LeisureLinux/workbuddy2api-panel
     - ardeyouxipianyi/workbuddy2api-hub
     - yuechuya/WorkBuddy2API-Gateway
     - HUIdada1/AgentHub
     - 3155498108/workbuddy-one
-    - sheng-du0521/workbuddy2api
     - OHCJ099/BuddyHub
     - hj01857655/WorkBuddy2api
-    - syan-anan/wb-syan
     - JackAIStudio/dsh-workbuddy-dual
     - smart-open/TraeWorkAssistant
     - deltrivx/AutoBuddy
@@ -85,7 +81,6 @@ upstream:
     - baiyea/workbuddy2api-ui
     - L0NE-6/WorkBuddy-Daily
     - hawklithm/workbuddy2api
-    - AI-Good-Tool/workbuddy-api
     # —— 多平台合集：Trae / Qoder / MiniMax / 豆包 的 IDE 账号池与签到池，看跨平台账号模型的抽象
     - xu20060420fan-cell/workbuddy2api-panel
     # 三协议 + 反检测头族 + 出站代理 + Prometheus 指标；mobile.css 与 /v1/search/messages 也回移自这里
@@ -104,8 +99,6 @@ upstream:
     - yang9582/workbuddy-connect
     # 三协议本地桥 + 网页控制台（启停 / 诊断 / 体检 / 对话测试），诊断面做得最全
     - Ianzhyh/workbuddy-to-dsh
-    # 按区域分键 + 额度感知故障转移 + 幂等维护窗口（时钟偏移不重复执行）
-    - weixiaokuan123/workbuddy-proxy
     # 少见的 /v2/embeddings 落地（bge-m3 1024 维，11351 未知模型），实验开关默认关
     - EchoPing07/Buddy-2API-Go
     # 九渠道合一：渠道内额度冷却与请求失败冷却分开记账，冷却期得分当 0 且路由硬剔除
@@ -124,8 +117,12 @@ upstream:
   # 每片 4 个仓串行：串行是硬要求（免费档 10 RPM 共享一个池），
   # 放大每片只为少付 setup 开销（每片一次 pip install ≈2 分钟）
   shard_size: 4
-  # 每轮最多真正落地几条（每条要起 agent 写代码、跑测试、开 PR）
-  land_max: 1
+  # 每轮最多真正落地几条（每条要起 agent 写代码、跑测试、开 PR）。
+  # 每条最坏 60 分钟（方案 30 + diff 30）——抬到 3 就必须同步抬 implement 的
+  # job 超时，否则第 3 条落地到一半被 job 超时掐掉，前两条也白跑。
+  # 注意：值得度同分（本轮 60/89 都是 3）时排序退化成文件名字母序，选哪三条
+  # 没有语义，只是「同分里的三条」。
+  land_max: 3
 
 policy:
   base: main
@@ -142,3 +139,22 @@ policy:
     - .github/workflows/**
     - AGENTS.md
     - config.example.json
+
+  # 「不做」清单：不是禁动作，是这个仓明确不要的能力。加一条只改这里。
+  # 三处都生效：分析提示词里带上（免得 agent 给 3 分）、报告命中的不落地（省掉 30 分钟实现）、
+  # 改动命中的在提交前驳回（报告写得干净、实现照做的也兜得住）。
+  # match 是不区分大小写的子串，会在报告正文和 diff 里各扫一遍。
+  off_limits:
+    - name: 多密钥 / 多人共用
+      why: 本仓只有一把管理员 api_key（httpauth.VerifyBearer 单串比对），不提供按人分发密钥、按人计量与限额。要多人用就自己搭一层反代。
+      match:
+        - client_keys
+        - clientkeys
+        - ClientKey
+        - api_keys
+        - admin_key_required
+        - 客户端密钥
+        - 多密钥
+        - 多 API Key
+        - 按人计量
+        - 按人限额

@@ -84,6 +84,12 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// 出图也有「上下文」（prompt，编辑还有原图）：同一开关，同一处归档。
+	if h.loadLive().RecordContext {
+		if tr := requestTraceFrom(r); tr != nil {
+			tr.context = archiveContext(raw)
+		}
+	}
 	prompt, _ := req["prompt"].(string)
 	if strings.TrimSpace(prompt) == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",

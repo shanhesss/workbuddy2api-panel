@@ -3,6 +3,19 @@
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 /* 账号备注的本机键（模块级声明放顶部，避开 TDZ）。 */
 const LS_REMARKS = 'wb2api.remarks.v1';
+/* 下拉框记忆（issue #160）的单一键：日志范围、模型排序这类纯 UI 偏好存一份 JSON。
+   写不进去（隐私模式 / 配额满）就当没设过——偏好丢了不影响功能，不能因此抛异常。 */
+const LS_PREF = 'wb2api.pref.v1';
+function prefGet(k) {
+  try { return (JSON.parse(localStorage.getItem(LS_PREF)) || {})[k] || ''; } catch (e) { return ''; }
+}
+function prefSet(k, v) {
+  try {
+    const m = JSON.parse(localStorage.getItem(LS_PREF)) || {};
+    if (v) m[k] = v; else delete m[k];
+    localStorage.setItem(LS_PREF, JSON.stringify(m));
+  } catch (e) { /* 偏好丢失可接受 */ }
+}
 let remarksCache = null;
 let proxyData = null, proxyPage = 1, proxyLoading = false, proxyEditID = null, proxySettingsDirty = false;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
@@ -11,7 +24,7 @@ let overviewData = null, cfgLoaded = null, updateData = null, updateBusy = false
 let logPin = true, loginState = null, loginTimer = null, loginStartAt = 0;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
-let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
+let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: prefGet('mdSort') || 'default' };
 /* 收纳行（「其余 N 个账号，展开」）的展开状态。必须存在 DOM 之外：账号池/任务中心视图
    每 5s 轮询重建 tbody，只把状态放在 aria-expanded / hidden 里会被下一轮渲染收回
    （表现为点「展开」后什么都不点又自动收起）。键 = tbody id。 */
@@ -370,18 +383,15 @@ function disabledAge(at) {
   return Math.floor(sec / 86400) + ' 天前';
 }
 
-function rateLimitRowsHtml(rows, now) {
+function rateLimitRowsHtml(rows, now, realm) {
   const list = Array.isArray(rows) ? rows.filter(row => row && row.model) : [];
   if (!list.length) return '';
   // 降级路由表（overview 的 model_fallback）：限流的模型若配了等价模型，标注
   // 「⤳ 已路由至 X」—— 否则用户看到「v4.1 限流」会以为服务断了，实际请求已被
   // 自动改道到等价模型继续服务。这条是用户实测反馈要求可见的。
-  const fb = (overviewData && overviewData.model_fallback) || {};
   return '<div class="rate-limits">' + list.map(row => {
     const m = rateLimitMeta(row, now);
-    // 双重查找：上游台账里的 model 可能带 realm 前缀（cn:x），配置里是裸名。
-    const bare = String(m.model || '').replace(/^[a-z]+:/, '');
-    const alt = fb[row.model] || fb[bare] || '';
+    const alt = fallbackTargetFor(m.model, realm);
     const route = alt ? '<span class="fb">⤳ 已路由至 ' + esc(alt) + '</span>' : '';
     const title = alt ? m.title + '；已自动改道到 ' + alt : m.title;
     return '<div class="rate-limit ' + (m.kind === 'model_unavailable' ? 'model-unavailable' : '') +
@@ -485,6 +495,24 @@ setTimeout(() => {
 /* ── 账号池 ───────────────────────────────────────────────────────── */
 let accRealmFilter = 'all';
 let lastAccountsList = [];
+/* 分组筛选（issue #159）：'' = 全部分组。lastVisibleAccounts 是当前表格真正渲染的行，
+   「组内批量」只对它生效——作用域与用户眼前看到的行一致，不会误伤被筛掉的账号。 */
+let accGroupFilter = '';
+let lastVisibleAccounts = [];
+
+/* syncGroupFilter 按当前账号列表重建分组下拉（组是自由标签，没有独立的组表可查）。
+   选中值不在新列表里就退回「全部分组」——否则筛到一个已清空的组会看到永远空表。 */
+function syncGroupFilter() {
+  const sel = $('accGroupFilter');
+  if (!sel) return;
+  const groups = [...new Set(lastAccountsList.map(s => s.group).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b, 'zh'));
+  if (accGroupFilter && !groups.includes(accGroupFilter)) accGroupFilter = '';
+  setHTML(sel, '<option value="">全部分组</option>' + groups.map(g =>
+    '<option value="' + esc(g) + '">' + esc(g) + ' (' +
+    lastAccountsList.filter(s => s.group === g).length + ')</option>').join(''));
+  sel.value = accGroupFilter;
+}
 
 function renderAccounts(list) {
   lastAccountsList = Array.isArray(list) ? list : [];
@@ -511,10 +539,20 @@ function renderAccounts(list) {
   } else if (accRealmFilter === 'global') {
     filtered = lastAccountsList.filter(s => s.realm === 'global');
   }
+  syncGroupFilter();
+  if (accGroupFilter) {
+    filtered = filtered.filter(s => (s.group || '') === accGroupFilter);
+  }
+  lastVisibleAccounts = filtered;
+  // 组内批量只在「筛到某一组」时才露出来：全部分组下这几个按钮等于第二个「全部签到」，
+  // 白占位还容易点错作用域。
+  if ($('accGroupActions')) $('accGroupActions').hidden = !accGroupFilter;
 
   if (!filtered.length) {
     if (!total) {
       setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>');
+    } else if (accGroupFilter) {
+      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">分组「' + esc(accGroupFilter) + '」下没有账号</div>在「备注」里给账号填上分组后就会出现在这里</div></td></tr>');
     } else if (accRealmFilter === 'cn') {
       setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">暂无国内版账号</div>当前账号池内均为国际版账号（共 ' + globalCnt + ' 个）</div></td></tr>');
     } else if (accRealmFilter === 'global') {
@@ -524,6 +562,11 @@ function renderAccounts(list) {
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   const maxCred = Math.max(1, ...filtered.map(s => s.credits || 0));
+  // 「探活」是冻结态专属动作，占独立槽位；整表没有冻结账号时连那一列都不占，
+  // 否则中间会空出一条无意义的缝。判定式与行内 cool 同源（只看是否 > 0）。
+  const nowF = Date.now();
+  const anyFrozen = filtered.some(s => s.disabled || Math.max(s.cool_remaining_sec || 0,
+    (new Date(s.breaker_until || 0) - nowF) / 1000, (new Date(s.degrade_until || 0) - nowF) / 1000) > 0);
   setHTML(tb, filtered.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
@@ -554,7 +597,7 @@ function renderAccounts(list) {
         (dk && dk.action ? '<span>' + esc(dk.action) + '</span>' : '') +
         '<div style="margin-top:2px;opacity:.85">' + esc(s.reason) + '</div></div>'
       : '';
-    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
+    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now(), s.realm);
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
@@ -609,7 +652,7 @@ function renderAccounts(list) {
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
-      '<td class="acts"><div class="acts-inner">' + [
+      '<td class="acts"><div class="acts-inner' + (anyFrozen ? ' with-probe' : '') + '">' + [
         // 无个人成长体系的账号（企业版 / 静态 API Key）不渲染「签到」「任务」：前者
         // 上游 400「企业账号不支持该操作」，后者 403 growth-only；只留「额度」，点它走
         // /balance，额度由 upstream 的企业口径端点（get-enterprise-user-usage）填充。
@@ -621,14 +664,15 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>',
         (personal ?
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' : ''),
-        (frozen ? '<button class="xs ghost" data-a="probe_ban" data-u="' + esc(s.uid) + '" title="只读探测上游是否已解封：不 revive、不参与选号、不改任何状态">探活</button>' : ''),
+        (frozen ? '<button class="xs ghost" data-a="probe_ban" data-u="' + esc(s.uid) + '" title="只读探测上游是否已解封：不 revive、不参与选号、不改任何状态">探活</button>'
+                : (anyFrozen ? '' : null)),
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (personal ? '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额' : '退出选号，但照常保活 / 刷新额度') + '">暂停选号</button>')),
         (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>'),
         '<button class="xs ghost" data-a="remark" data-u="' + esc(s.uid) + '" title="给这个账号起个本机备注（只存浏览器）">备注</button>',
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>',
-      ].map(html => html || '<span class="slot" aria-hidden="true"></span>').join('') +
+      ].filter(html => html !== null).map(html => html || '<span class="slot" aria-hidden="true"></span>').join('') +
       '</div></td></tr>';
   }).join(''));
 }
@@ -636,6 +680,17 @@ function renderAccounts(list) {
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。后端已按
 // 「整池不可用 → 此刻没号 → 部分限流」排好序，这里只做展示（移植上游 PR #120）。
 const ML_STATE = { locked: ['bad', '全池锁定'], starved: ['warn', '此刻无号'], partial: ['ok', '部分限流'] };
+/* fallbackTargetFor 查该 (域, 模型) 配置的降级目标（未配置 → 空串）。
+   配置键既可能是裸名，也可能带 cn:/global: 前缀，查找顺序必须与网关侧
+   lookupFallback 一致：带域前缀的键优先，再回退裸名——只查裸名会让按域
+   配置的键整表失效，限流的模型看不到「已路由至」。限流行（rateLimitRowsHtml）
+   与锁池表（renderModelLocks）共用；函数声明提升，两处调用均可用。 */
+function fallbackTargetFor(model, realm) {
+  if (!model) return '';
+  const bare = String(model).replace(/^[a-z]+:/, '');
+  const t = (overviewData && overviewData.model_fallback) || {};
+  return (realm ? t[realm + ':' + bare] : '') || t[model] || t[bare] || '';
+}
 function renderModelLocks(rows) {
   const tb = $('mlBody');
   const list = Array.isArray(rows) ? rows : [];
@@ -648,8 +703,14 @@ function renderModelLocks(rows) {
     const [cls, label] = ML_STATE[r.state] || ['', r.state || '—'];
     const unlock = r.unlock_at && !/^0001-/.test(r.unlock_at) ? fmtLocalDateTime(r.unlock_at) : '—';
     const fully = r.fully_unlock_at && !/^0001-/.test(r.fully_unlock_at) ? fmtLocalDateTime(r.fully_unlock_at) : '—';
+    // 「锁了但请求照样能过」是这张表最容易误读的地方：配了降级路由表时，该模型
+    // 在本域不可用，请求已被网关改道到等价模型继续服务。不标出来，会把
+    // 「global flash 锁定」直接读成「flash 服务中断」。
+    const alt = fallbackTargetFor(r.model, r.realm);
+    const route = alt ? '<div class="fb" title="该模型在本域不可用时，请求已自动改道到 ' +
+      esc(alt) + '">⤳ 已路由至 ' + esc(alt) + '</div>' : '';
     return '<tr>' +
-      '<td><b>' + esc(r.model) + '</b></td>' +
+      '<td><b>' + esc(r.model) + '</b>' + route + '</td>' +
       '<td>' + (r.realm === 'global' ? '国际版' : '国内版') + '</td>' +
       '<td><span class="tag ' + cls + '">' + label + '</span></td>' +
       '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
@@ -666,9 +727,15 @@ function displayVersion(version) {
   return value === 'dev' ? 'dev' : 'v' + value;
 }
 
+function unknownVersionNote(update) {
+  const label = displayVersion(update.current_version) === 'dev' ? '开发构建 · 无法比较版本' : '当前版本无法比较';
+  return label + (update.latest_version ? ' · 最新 Release v' + update.latest_version : '');
+}
+
 function renderUpdateStatus(update) {
   if (!update) return;
   updateData = update;
+  const unknown = update.current_known === false;
   const local = displayVersion(update.current_version);
   $('navSub').textContent = local;
   $('navVer').textContent = local;
@@ -680,6 +747,8 @@ function renderUpdateStatus(update) {
     note.textContent = '正在准备更新…';
   } else if (update.last_error) {
     note.textContent = '更新失败：' + update.last_error;
+  } else if (unknown) {
+    note.textContent = unknownVersionNote(update);
   } else if (update.update_available) {
     note.textContent = '发现新版本 v' + update.latest_version + (update.can_install ? '' : ' · 请手动更新');
   } else if (update.latest_version) {
@@ -689,7 +758,7 @@ function renderUpdateStatus(update) {
   }
   $('btnUpdateInstall').hidden = !update.update_available || !update.can_install;
   $('btnUpdateInstall').disabled = updateBusy || !!update.installing;
-  $('btnUpdateRelease').hidden = !update.update_available || !!update.can_install || !update.release_url;
+  $('btnUpdateRelease').hidden = (!update.update_available && !unknown) || !!update.can_install || !update.release_url;
   $('btnUpdateCheck').disabled = updateBusy || !!update.installing;
 }
 
@@ -702,7 +771,10 @@ async function checkForUpdates() {
   try {
     const update = await api('update/check', { method: 'POST' });
     renderUpdateStatus(update);
-    toast(update.update_available ? '发现新版本 v' + update.latest_version : '当前已是最新版本', update.update_available ? 'ok' : '');
+    let message = '当前已是最新版本';
+    if (update.current_known === false) message = unknownVersionNote(update);
+    else if (update.update_available) message = '发现新版本 v' + update.latest_version;
+    toast(message, update.update_available ? 'ok' : '');
   } catch (e) {
     try { renderUpdateStatus(await api('update')); } catch (_) {}
     toast('检查更新失败：' + e.message, 'err');
@@ -881,6 +953,44 @@ if ($('accRealmTabs')) {
     renderAccounts(lastAccountsList);
   });
 }
+if ($('accGroupFilter')) {
+  $('accGroupFilter').onchange = () => {
+    accGroupFilter = $('accGroupFilter').value;
+    renderAccounts(lastAccountsList);
+  };
+}
+/* 组内批量（issue #159）：作用域 = 当前表格里可见的行（lastVisibleAccounts），
+   逐号打已有的单号接口——不新增批量端点，也不改调度器。签到跳过企业版/静态 Key
+   与已禁用号：它们的签到端点注定 4xx，统计里不该算失败。 */
+const GROUP_ACT = {
+  checkin: { verb: '签到', ok: s => !s.enterprise && !s.api_key && !s.disabled },
+  pause: { verb: '暂停选号', ok: s => !s.paused && !s.disabled },
+  resume: { verb: '恢复选号', ok: s => s.paused },
+};
+if ($('accGroupActions')) {
+  $('accGroupActions').addEventListener('click', async ev => {
+    const b = ev.target.closest('button[data-gact]');
+    if (!b) return;
+    const act = GROUP_ACT[b.dataset.gact];
+    if (!act) return;
+    const targets = lastVisibleAccounts.filter(act.ok);
+    if (!targets.length) { toast('当前分组里没有需要「' + act.verb + '」的账号', 'warn'); return; }
+    // 恢复选号把号推回流量池、暂停选号把它撤出来，都影响在线请求，先确认再动手。
+    if (b.dataset.gact !== 'checkin' &&
+        !confirm('对分组「' + accGroupFilter + '」的 ' + targets.length + ' 个账号执行「' + act.verb + '」？')) return;
+    b.disabled = true;
+    let ok = 0;
+    const bad = [];
+    for (const s of targets) {
+      try { await api('accounts/' + encodeURIComponent(s.uid) + '/' + b.dataset.gact, { method: 'POST' }); ok++; }
+      catch (e) { bad.push((s.nickname || String(s.uid).slice(0, 8)) + '：' + e.message); }
+    }
+    b.disabled = false;
+    toast('组内' + act.verb + '：成功 ' + ok + ' 个' +
+      (bad.length ? '，失败 ' + bad.length + ' 个（' + bad[0] + '）' : ''), bad.length ? 'warn' : 'ok');
+    loadOverview(true);
+  });
+}
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
 /* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，
@@ -1016,6 +1126,7 @@ async function loadModels(force) {
     const srcNote = { 'v3-desktop': '', 'v3-union': ' · ⚠ 国际版目录来自回落（IDE+CLI 并集）', 'enterprise': ' · ⚠ 国际版目录已降级到企业端点（窄目录/旧倍率）' }[d.global_source] || '';
     $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '') + srcNote;
     renderModels();
+    refreshEffortDowngradeNote(); // 模型目录到位后才知道哪些档位会降级
   } catch (e) {
     mdAll = [];
     tb.innerHTML = '<tr><td colspan="9"><div class="empty">' + esc(e.message) + '</div></td></tr>';
@@ -1272,6 +1383,7 @@ function resetModelFilter() {
   mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
   $('mdQ').value = ''; $('mdRealm').value = ''; $('mdCap').value = '';
   $('mdEffort').value = ''; $('mdPromo').value = ''; $('mdSort').value = 'default';
+  prefSet('mdSort', '');
   renderModels();
 }
 
@@ -1284,25 +1396,31 @@ $('mdQ').oninput = () => {
 for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'effort'], ['mdPromo', 'promo'], ['mdSort', 'sort']]) {
   const el = $(id);
   if (!el) continue;
-  el.onchange = () => { mdFilter[key] = el.value; renderModels(); };
+  // 排序方式记住上次选择（issue #160）：其余筛选项是一次性查询，排序是长期偏好。
+  if (key === 'sort' && mdFilter.sort) el.value = mdFilter.sort;
+  el.onchange = () => {
+    mdFilter[key] = el.value;
+    if (key === 'sort') prefSet('mdSort', el.value === 'default' ? '' : el.value);
+    renderModels();
+  };
 }
 $('mdReset').onclick = resetModelFilter;
 $('btnModels').onclick = () => loadModels(true);
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
-// 运行日志的增量拉取状态（perf）：logRows 是本地窗口，logSinceTs 是下次增量的起点。
+// 运行日志的增量拉取状态（perf）：logRows 是本地窗口，logSeq 是下次增量的起点。
 // 常态每 5 秒只传新增行，不再每轮重拉 500 行（~90KB）并重建整块 DOM。
 // LOG_ROWS_MAX 与服务端环形缓冲同量级（500）——本地窗口不必更大。
 let logRows = [];
-let logSinceTs = null;
-let logSince = '';
+let logSeq = 0;
+let logCursorAt = null;
 const LOG_ROWS_MAX = 500;
 // 增量游标最长有效期：超过则改全量拉（服务端环形缓冲只有 500 行，久了会淘汰
 // 中间旧行，增量就拿不到「完整的一段」）。
 const LOG_CURSOR_MAX_AGE_MS = 5 * 60 * 1000;
 // resetLogWindow 丢弃本地窗口，下次改为全量拉（切视图/手动重载时用）。
-function resetLogWindow() { logRows = []; logSinceTs = null; logSince = ''; }
+function resetLogWindow() { logRows = []; logSeq = 0; logCursorAt = null; }
 $('logChips').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-ch]');
   if (!b) return;
@@ -1340,10 +1458,10 @@ async function loadLogs() {
     // 例外：切走很久再回来时，服务端环形缓冲（500 行）可能已经把中间的旧行
     // 淘汰掉了——增量只会拿到「还在环里」的那部分，中间缺一段。因此游标超过
     // LOG_CURSOR_MAX_AGE_MS 就退回全量拉（一次 90KB，换来不缺行）。
-    if (logSinceTs && (Date.now() - logSinceTs.getTime()) > LOG_CURSOR_MAX_AGE_MS) {
+    if (logCursorAt && (Date.now() - logCursorAt.getTime()) > LOG_CURSOR_MAX_AGE_MS) {
       resetLogWindow();
     }
-    const lq = logSince ? '?since=' + encodeURIComponent(logSince) : '';
+    const lq = logSeq ? '?since_seq=' + logSeq : '';
     const [d, requestRows, credit, errSum] = await Promise.all([
       api('logs' + lq),
       api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
@@ -1362,19 +1480,29 @@ async function loadLogs() {
     renderRequestMetrics(metrics, recent);
     // 增量合并到本地窗口（增量拉到的行 append；全量拉到的行 replace）。
     const incoming = d.entries || [];
-    if (logSince) {
+    if (logSeq) {
       logRows = logRows.concat(incoming);
       if (logRows.length > LOG_ROWS_MAX) logRows = logRows.slice(-LOG_ROWS_MAX);
     } else {
       logRows = incoming.slice(-LOG_ROWS_MAX);
     }
-    // 下次增量的起点：本次收到的最后一条的时间戳（同毫秒的多条会被一起带上，
-    // 重复无害——服务端按 After(since) 过滤，同毫秒条目可能重复一次；用
-    // 「已见过的最大 ts」而不是「现在」是对的：不能漏）。
+    // 下次增量的起点：**服务端给的单调节号 seq**，不是时间戳。
+    //
+    // 时间戳在这里靠不住：入环 TS 是 time.Now()，同一时钟刻度内的多次写入完全相同
+    // （Windows 实测 ~15.6ms 粒度，一次 Write 的多行、背靠背的 Write 都会撞）。
+    // 按「最后一条的 ts」推进游标时，同一刻度里排在它后面（或就是它自己）的行
+    // 永远满足「晚于 since」，于是每轮轮询都重复返回一次、游标再也不前进——
+    // 面板「运行日志」底部那行反复刷出来。JS 的 Date 还只有毫秒，把原始串换成
+    // Date 往返只会让重复更严重。
+    // seq 是环内单调递增的（淘汰不回退），`seq > logSeq` 精确表达「还有哪些没给过」。
     for (const e of incoming) {
-      if (e && e.ts && (!logSinceTs || new Date(e.ts) > logSinceTs)) logSinceTs = new Date(e.ts);
+      if (e && typeof e.seq === 'number' && e.seq > logSeq) logSeq = e.seq;
     }
-    logSince = logSinceTs ? logSinceTs.toISOString() : '';
+    // logCursorAt 记的是「上次成功同步的时刻」，不是「上次出现新行的时刻」：
+    // 老化判断要回答的是「我离开多久没跟了」，与有没有新日志无关。空闲时也刷新，
+    // 否则静默期每 5 分钟就会误触发一次全量拉（90KB 白拉）。真正切走很久再回来时
+    // 轮询本来就停了，这里的值会自然变旧，届时照旧回落全量。
+    logCursorAt = new Date();
     const entries = logRows.filter(e => logCh === 'all' || e.ch === logCh);
     setHTML(box, entries.length
       ? entries.map(e => {
@@ -1650,6 +1778,7 @@ const CFG_MAP = {
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
+  web_activity_enabled: ['schedule', 'web_activity_enabled'],
   growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   growth_concurrency: ['schedule', 'growth_concurrency'],
   include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
@@ -1676,15 +1805,20 @@ const CFG_MAP = {
   timeout_seconds: ['upstream', 'timeout_seconds'], header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
+  keep_recent_rounds: ['prompt', 'keep_recent_rounds'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   sanitize_brand_scope: ['features', 'sanitize_brand_scope'],
   embeddings_enabled: ['features', 'embeddings_enabled'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
+  request_archive_context: ['logging', 'request_archive_context'],
   models_hidden: ['models', 'hidden'],
   models_allowed: ['models', 'allowed'],
   models_aliases: ['models', 'aliases'],
   thinking_enabled: ['thinking', 'enabled'],
+  thinking_default_effort: ['thinking', 'default_effort'],
+  cn_chat_base: ['cn', 'chat_base'], cn_billing_base: ['cn', 'billing_base'],
+  global_chat_base: ['global', 'chat_base'], global_billing_base: ['global', 'billing_base'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
  *
@@ -1697,7 +1831,7 @@ const CFG_MAP = {
  * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
-const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file', 'cn_chat_base', 'cn_billing_base', 'global_chat_base', 'global_billing_base']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -1736,7 +1870,41 @@ async function loadConfig() {
     $('cfgKey').disabled = !!d.api_key_env_managed;
     $('cfgKey').title = d.api_key_env_managed ? '访问密钥由启动环境变量设置，请在部署配置中修改。' : '';
     $('cfgNote').textContent = managed.length ? '由启动环境管理：' + managed.join('、') : '';
+    refreshEffortDowngradeNote(); // 回填后按当前值算一次降级提示
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
+}
+
+/* 默认网关档位不支持提示：选中档位若高于/低于某些模型的支持范围，网关会按
+   「≤ 目标档的最高支持档，没有更低的正档则取最低正档」降级（off 不参与降级）。
+   数据来自 /panel/api/models 的 gateway_effort_wanted vs gateway_effort——
+   后端用出站同一套 ResolveGatewayEffort 算的，提示与真实注入不会漂移。
+
+   只在「改了默认档」时才需要重算，但模型目录是异步拉的（可能比配置晚到），
+   所以两处都调：配置回填后、模型列表加载后。目录为空时静默隐藏（不编造）。 */
+function refreshEffortDowngradeNote() {
+  const el = $('effortDowngradeNote');
+  if (!el) return;
+  const sel = $('cfgForm') && $('cfgForm').elements['thinking_default_effort'];
+  const want = sel ? String(sel.value || '').trim().toLowerCase() : '';
+  const models = (typeof mdAll !== 'undefined' && Array.isArray(mdAll)) ? mdAll : [];
+  if (!want || !models.length) { el.textContent = ''; return; }
+  // 只统计「真正会降级」的模型：目标档与生效档不同，且生效档非空（空 = 不改写，
+  // 比如该模型根本没声明档位，不属于降级）。
+  const downgraded = models.filter(m => {
+    const got = String(m.gateway_effort || '').trim().toLowerCase();
+    const w = String(m.gateway_effort_wanted || '').trim().toLowerCase();
+    return got && w === want && got !== want;
+  });
+  if (!downgraded.length) { el.textContent = ''; return; }
+  // 按落点聚合，最多列前三个，其余归到「等 N 个」——几十个模型全列出来会把面板撑爆。
+  const byTarget = {};
+  for (const m of downgraded) {
+    const t = String(m.gateway_effort || '').toLowerCase();
+    (byTarget[t] || (byTarget[t] = [])).push(m.id || '');
+  }
+  const parts = Object.keys(byTarget).sort().map(t => byTarget[t].length + ' 个降到 ' + t);
+  el.textContent = '⚠ 当前有 ' + downgraded.length + ' 个模型不支持 ' + want + '：' + parts.join('、') +
+    '（逐个模型可在「模型与档位」页的「网关档位」列单独指定）';
 }
 // thinkingModeOf 由 thinking.client_priority + override_scope 推导三选一的选中项。
 // 缺省（未写客户端优先）= 客户端优先，与 config 默认值一致。
@@ -1803,6 +1971,11 @@ function markDurationFields() {
 $('cfgForm').addEventListener('input', ev => {
   if (DURATION_FIELDS.includes(ev.target.name)) markDurationFields();
 });
+// 改「默认网关档位」时立刻重算降级提示：让操作员在保存前就看到「这一档有几个模型
+// 支持、几个会降级」，而不是保存后去事件日志里猜实际生效的档位。
+$('cfgForm').addEventListener('change', ev => {
+  if (ev.target.name === 'thinking_default_effort') refreshEffortDowngradeNote();
+});
 $('btnEye').onclick = () => {
   const el = $('cfgKey');
   const show = el.type === 'password';
@@ -1810,6 +1983,28 @@ $('btnEye').onclick = () => {
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
 $('btnCfgReload').onclick = loadConfig;
+// cfgRealmFilter 配置页分域切换：all 显示全部；cn/global 仅显示该域专属字段
+// （data-realm 标记）。共享配置（无 data-realm）始终显示。保存时仍回传整份配置，
+// 故切换仅控制可见性、不丢字段。域名 base 等各域独立配置由此分开关，与账号池
+// 已有的 accRealmTabs 同构。
+let cfgRealmFilter = 'all';
+function applyCfgRealmFilter() {
+  document.querySelectorAll('#cfgForm [data-realm]').forEach(el => {
+    const r = el.getAttribute('data-realm');
+    el.style.display = (cfgRealmFilter === 'all' || cfgRealmFilter === r) ? '' : 'none';
+  });
+  const tabs = $('cfgRealmTabs');
+  if (tabs) tabs.querySelectorAll('button[data-realm]').forEach(b => b.classList.toggle('on', b.dataset.realm === cfgRealmFilter));
+}
+if ($('cfgRealmTabs')) {
+  $('cfgRealmTabs').addEventListener('click', ev => {
+    const btn = ev.target.closest('button[data-realm]');
+    if (!btn) return;
+    cfgRealmFilter = btn.dataset.realm;
+    applyCfgRealmFilter();
+  });
+  applyCfgRealmFilter();
+}
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
@@ -3698,6 +3893,35 @@ function renderExpirySnapshot(d) {
       '<td class="num">' + fmtTok(daily) + '</td>' +
       '</tr>';
   };
+  // 跨账号合计（issue #102）：同一份快照、同样只算有未来批次的号，按 UTC+8 自然日
+  // 累加「该日到期」。cn/global 的积分不同源，混用时按域分开合计——混加一行没有意义。
+  const expRealm = a => (a.realm === 'global' ? 'global' : 'cn');
+  const splitRealm = new Set(rows.map(r => expRealm(r.a))).size > 1;
+  const dayMap = new Map();
+  for (const { a, bs } of rows) {
+    for (const b of bs) {
+      const key = (splitRealm ? expRealm(a) + '|' : '') + b.date;
+      let t = dayMap.get(key);
+      if (!t) dayMap.set(key, t = { date: b.date, realm: expRealm(a), remain: 0, uids: new Set() });
+      t.remain += b.remain;
+      t.uids.add(String(a.uid || ''));  // 同一账号同日多批只算一个号
+    }
+  }
+  const dayTotals = [...dayMap.values()].sort((x, y) =>
+    (x.date < y.date ? -1 : x.date > y.date ? 1 : 0) || (x.realm < y.realm ? -1 : 1));
+  if ($('expTotalNote')) {
+    $('expTotalNote').textContent = dayTotals.length ? dayTotals.length + ' 个到期日' : '暂无';
+  }
+  $('expTotalBody').innerHTML = dayTotals.map(t => {
+    const days = expDayDiff(t.date);
+    return '<tr><td>' + esc(t.date) +
+      (splitRealm ? ' <span class="tag mute">' + (t.realm === 'global' ? '国际版' : '国内版') + '</span>' : '') +
+      '</td>' +
+      '<td class="num" style="color:' + (days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)') + '">' +
+        (days === 0 ? '今天' : days === 1 ? '明天' : days + ' 天') + '</td>' +
+      '<td class="num">' + fmtTok(t.remain) + '</td>' +
+      '<td class="num">' + t.uids.size + '</td></tr>';
+  }).join('');
   // 收纳行沿用「积分构成」页的分组行样式（pk-group-summary / pk-group-toggle）。
   const rest = rows.slice(EXP_HEAD);
   $('expBody').innerHTML = !rows.length ? '<tr><td colspan="5">暂无未来到期批次</td></tr>'
@@ -4052,14 +4276,20 @@ function storeRemarks(map) {
 /* 编辑器的行来自 overview 缓存（账号池加载过就有），另外补上「已有备注但当前列表里
    没有」的键，避免账号被移除后备注看起来凭空消失。 */
 function remarkFormRows() {
+  // key = uid 前 8 位（备注映射的键）；uid 保留全值，分组要打真接口按完整 uid 走；
+  // inPool=false 的行是「账号已不在池里、但本机还留着备注」的孤儿，只能改备注。
   const rows = ((overviewData && overviewData.accounts) || [])
-    .map(s => ({ uid: remarkKey(s.uid), who: s.nickname || remarkKey(s.uid) }))
-    .filter(r => r.uid);
+    .map(s => ({ key: remarkKey(s.uid), uid: s.uid, who: s.nickname || remarkKey(s.uid), group: s.group || '', inPool: true }))
+    .filter(r => r.key);
   for (const k of Object.keys(remarksAll())) {
-    if (!rows.some(r => r.uid === k)) rows.push({ uid: k, who: k });
+    if (!rows.some(r => r.key === k)) rows.push({ key: k, uid: '', who: k, group: '', inPool: false });
   }
   return rows;
 }
+
+/* 分组编辑的原始值（保存时只提交真正改动过的行，避免「保存备注」顺手把几十个账号
+   的分组各打一次接口）。 */
+let remarkGroupOrig = {};
 /* onlyUID 非空时只渲染该账号一行（账号池行内「备注」按钮走这条），避免为改一个号
    在几十行里翻找。 */
 function renderRemarkBody(onlyUID) {
@@ -4068,11 +4298,17 @@ function renderRemarkBody(onlyUID) {
   let rows = remarkFormRows();
   if (onlyUID) {
     const k = remarkKey(onlyUID);
-    rows = rows.filter(r => r.uid === k);
+    rows = rows.filter(r => r.key === k);
   }
+  remarkGroupOrig = {};
+  rows.forEach(r => { if (r.inPool) remarkGroupOrig[r.uid] = r.group; });
   box.innerHTML = rows.length
     ? rows.map(r => '<div class="rm-row"><span class="rm-who" title="' + esc(r.who) + '">' + esc(r.who) + '</span>' +
-        '<input type="text" data-uid="' + esc(r.uid) + '" value="' + esc(remarksAll()[r.uid] || '') + '" placeholder="备注（留空即清除）" maxlength="24"></div>').join('')
+        '<input type="text" data-uid="' + esc(r.key) + '" value="' + esc(remarksAll()[r.key] || '') + '" placeholder="备注（留空即清除）" maxlength="24">' +
+        (r.inPool
+          ? '<input type="text" data-guid="' + esc(r.uid) + '" value="' + esc(r.group) + '" placeholder="分组（留空即未分组）" maxlength="24">'
+          : '<input type="text" value="（账号已不在池里）" disabled>') +
+        '</div>').join('')
     : '<div class="empty">暂无账号：先在「账号池」加载一次账号列表。</div>';
 }
 function openRemarks(onlyUID) {
@@ -4080,7 +4316,7 @@ function openRemarks(onlyUID) {
   if ($('remarkVeil')) $('remarkVeil').classList.add('on');
 }
 function closeRemarks() { if ($('remarkVeil')) $('remarkVeil').classList.remove('on'); }
-function saveRemarkForm() {
+async function saveRemarkForm() {
   // 在现有映射上合并：单账号编辑器里只有一行，整体替换会把其它号的备注全清掉。
   const map = Object.assign({}, remarksAll());
   document.querySelectorAll('#remarkBody input[data-uid]').forEach(inp => {
@@ -4089,11 +4325,29 @@ function saveRemarkForm() {
     else delete map[k];
   });
   const saved = storeRemarks(map);
+  // 分组是服务端字段：只提交真正改动过的行，其余账号不发请求。
+  const changed = [];
+  document.querySelectorAll('#remarkBody input[data-guid]').forEach(inp => {
+    const uid = inp.getAttribute('data-guid'), v = inp.value.trim();
+    if ((remarkGroupOrig[uid] || '') !== v) changed.push([uid, v]);
+  });
   closeRemarks();
-  // 备注只影响本机展示：重渲染当前视图即可，无需后端参与。
+  let ok = 0;
+  const bad = [];
+  for (const [uid, group] of changed) {
+    try { await api('accounts/' + encodeURIComponent(uid) + '/group', { method: 'POST', body: JSON.stringify({ group }) }); ok++; }
+    catch (e) { bad.push(uid.slice(0, 8) + '：' + e.message); }
+  }
   if (view === 'accounts') loadOverview(true);
   else if (view === 'usage' && usageData) renderUsage(usageData);
-  toast(saved ? '备注已保存（仅本机浏览器）' : '备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失', saved ? '' : 'err');
+  if (changed.length) {
+    const head = bad.length
+      ? '分组已更新 ' + ok + ' 个，失败 ' + bad.length + ' 个（' + bad[0] + '）'
+      : '分组已更新 ' + ok + ' 个';
+    toast(head + (saved ? '' : '；备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失'), bad.length || !saved ? 'err' : 'ok');
+  } else {
+    toast(saved ? '备注已保存（仅本机浏览器）' : '备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失', saved ? '' : 'err');
+  }
 }
 if ($('btnRemarks')) $('btnRemarks').onclick = () => openRemarks('');
 if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
@@ -4888,6 +5142,8 @@ function fmtTokens(n) {
 
 /* ── 请求事件日志 (Keeper 风格大屏) ────────────────────────────────── */
 let rawEventsData = [];
+// eventRows 当前筛选后的行序（与表格 data-ev 下标一致）：展开上下文时按它取事件。
+let eventRows = [];
 
 async function loadEvents() {
   const tb = $('eventTableBody');
@@ -4952,7 +5208,8 @@ function renderEventTable() {
     return;
   }
 
-  const html = filtered.map(e => {
+  eventRows = filtered;
+  const html = filtered.map((e, i) => {
     const d = new Date(e.time);
     const tStr = isNaN(d) ? '-' : (String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') + ':' + String(d.getSeconds()).padStart(2, '0'));
     const dStr = isNaN(d) ? '' : (d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate());
@@ -4960,7 +5217,10 @@ function renderEventTable() {
     const acctRaw = e.account || '-';
     const acctClean = acctRaw.replace(/\([^)]*\)/, '');
     const mName = e.model || '-';
-    const effort = e.reasoning_effort || '-';
+    const effort = e.reasoning_effort || '';
+    // 旧归档行没有这个键（不知道客户端发了什么）；新行恒有（空串 = 确认没发）。
+    const hasEffortReq = 'reasoning_effort_requested' in e;
+    const effortReq = e.reasoning_effort_requested || '';
 
     let resTag = '<span class="tag-badge tag-success">成功</span>';
     if (e.status === 429) {
@@ -4995,11 +5255,11 @@ function renderEventTable() {
     const ip = e.client_ip || '-';
     const ua = e.user_agent || '-';
 
-    return '<tr>' +
+    return '<tr data-ev="' + i + '"' + (e.context ? ' title="点击查看请求上下文"' : '') + '>' +
       '<td class="time-cell"><div class="t-time">' + esc(tStr) + '</div><div class="t-date">' + esc(dStr) + '</div></td>' +
       '<td><div class="acct-cell"><span class="acct-icon"></span><span title="' + esc(acctRaw) + '">' + esc(acctClean) + '</span></div></td>' +
       '<td class="model-cell"><div class="m-name">' + esc(mName) + '</div></td>' +
-      '<td><span class="pill-effort">' + esc(effort) + '</span></td>' +
+      '<td>' + eventEffortPill(effort, effortReq, hasEffortReq) + '</td>' +
       '<td>' + resTag + '</td>' +
       '<td><span class="req-tag">' + esc(reqProto) + '</span><div class="req-path-sub">' + esc(reqPath) + '</div></td>' +
       '<td><div class="metric-main">' + esc(durSec) + '</div><div class="metric-sub">' + esc(ttfbSec) + '</div></td>' +
@@ -5014,6 +5274,49 @@ function renderEventTable() {
 
   setHTML(tb, html);
 }
+
+// eventEffortPill 事件页「推理强度」列：「客户端要的」→「网关实际发出去的」两段显示。
+// 网关会在客户端没带档位时补模型默认档（thinking 默认档）、按策略改写或就近降级；
+// 只显示生效值时整列都是 max，看不出这一档是谁定的（与聊天行日志的
+// effort=max->high / effort=- ->max 同一口径）。
+//   - 一致：max；不一致（改写/降级）：high→max；客户端没发（网关补默认档）：-→max；都没有：-
+//   - hasReq=false 是升级前的老归档行（没有这个键），按旧口径只显示生效值，不臆测。
+function eventEffortPill(eff, req, hasReq) {
+  if (!hasReq) return '<span class="pill-effort">' + esc(eff || '-') + '</span>';
+  if (!eff && !req) return '<span class="pill-effort">-</span>';
+  if (!req) return '<span class="pill-effort" title="客户端未携带思考档位，这是网关补的默认档">-→' + esc(eff) + '</span>';
+  if (!eff) return '<span class="pill-effort" title="客户端要求关闭思考，或该档位模型不支持">' + esc(req) + '</span>';
+  if (req === eff) return '<span class="pill-effort">' + esc(eff) + '</span>';
+  return '<span class="pill-effort" title="左：客户端请求；右：网关实际发送">' + esc(req) + '→' + esc(eff) + '</span>';
+}
+
+// renderEventContext 把一次请求的会话上下文渲染成「角色 + 原文」块。
+// 只认 archiveContext 写出的三种键（system / messages / prompt）；content 是数组的
+// 多模态块原样 JSON 展示——拆开反而丢掉结构。
+function renderEventContext(ctx) {
+  if (!ctx) return '<div class="ev-ctx-empty">本次请求没有记录上下文（在「配置 → 日志」打开「记录请求上下文」后新产生的请求才有）</div>';
+  const textOf = c => typeof c === 'string' ? c : (c == null ? '' : JSON.stringify(c, null, 2));
+  const block = (role, text) => '<div class="ev-ctx-msg"><span class="ev-ctx-role">' + esc(role) + '</span><pre>' + esc(text) + '</pre></div>';
+  const parts = [];
+  if (ctx.system != null) parts.push(block('system', textOf(ctx.system)));
+  if (ctx.prompt != null) parts.push(block('prompt', textOf(ctx.prompt)));
+  (ctx.messages || []).forEach(m => parts.push(block((m && m.role) || '?', textOf(m && m.content))));
+  return '<div class="ev-ctx">' + parts.join('') + '</div>';
+}
+
+// 事件行点击打开上下文弹窗。挂 tbody 一次，重渲染后照样有效。
+if ($('eventTableBody')) $('eventTableBody').onclick = ev => {
+  const tr = ev.target.closest('tr[data-ev]');
+  if (!tr) return;
+  const e = eventRows[Number(tr.dataset.ev)] || {};
+  // 标题带上请求身份：弹窗遮住表格后，否则看不出打开的是哪一条。
+  $('evCtxHint').textContent = [e.time ? fmtLocalDateTime(e.time) : '', e.path, e.model].filter(Boolean).join(' · ');
+  setHTML($('evCtxBody'), renderEventContext(e.context));
+  $('evCtxVeil').classList.add('on');
+};
+if ($('btnEvCtxClose')) $('btnEvCtxClose').onclick = () => $('evCtxVeil').classList.remove('on');
+// 点遮罩关闭（与其它弹窗一致：只在点在 veil 自身时关，点内容不关）。
+if ($('evCtxVeil')) $('evCtxVeil').onclick = ev => { if (ev.target === $('evCtxVeil')) $('evCtxVeil').classList.remove('on'); };
 
 function formatEventNum(n) {
   if (!n || n < 0) return '0';
@@ -5034,10 +5337,39 @@ function deriveEventExecutor(ua) {
   return 'WorkBuddyExecutor';
 }
 
+// 筛选下拉记住上次选择（issue #160）：日志范围和状态是长期偏好，模型/来源是一次性
+// 查询——后者每次都会按当前归档重建选项，记住反而容易指向已不存在的事件。
+if ($('eventFilterStatus')) {
+  const saved = prefGet('eventStatus');
+  if (saved) $('eventFilterStatus').value = saved;
+}
+if ($('eventFilterLimit')) {
+  const saved = prefGet('eventLimit');
+  if (saved) $('eventFilterLimit').value = saved;
+}
 if ($('eventFilterModel')) $('eventFilterModel').onchange = renderEventTable;
 if ($('eventFilterAccount')) $('eventFilterAccount').onchange = renderEventTable;
-if ($('eventFilterStatus')) $('eventFilterStatus').onchange = renderEventTable;
-if ($('eventFilterLimit')) $('eventFilterLimit').onchange = loadEvents;
+if ($('eventFilterStatus')) $('eventFilterStatus').onchange = () => {
+  prefSet('eventStatus', $('eventFilterStatus').value);
+  renderEventTable();
+};
+if ($('eventFilterLimit')) $('eventFilterLimit').onchange = () => {
+  prefSet('eventLimit', $('eventFilterLimit').value);
+  loadEvents();
+};
+// 清空归档（issue #160）：删的是磁盘上的事件文件，不可恢复，二次确认后再打。
+if ($('btnEventClearLogs')) $('btnEventClearLogs').onclick = async () => {
+  if (!confirm('清空归档会删掉归档目录里的全部请求事件文件（不可恢复，导出过的 JSON 不受影响）。确认清空？')) return;
+  const b = $('btnEventClearLogs');
+  b.disabled = true;
+  try {
+    const r = await api('request_logs/clear', { method: 'POST' });
+    toast('已清空归档：删除 ' + (r.files || 0) + ' 个文件（' + fmtBytes(r.bytes || 0) + '）', 'ok');
+    await loadEvents();
+  } catch (e) {
+    toast('清空失败：' + e.message, 'err');
+  } finally { b.disabled = false; }
+};
 if ($('btnEventClearFilters')) $('btnEventClearFilters').onclick = () => {
   if ($('eventFilterModel')) $('eventFilterModel').value = '';
   if ($('eventFilterAccount')) $('eventFilterAccount').value = '';
@@ -5129,6 +5461,18 @@ function renderProxies() {
       '<td><input type="checkbox" data-proxy-toggle="' + esc(p.id) + '" aria-label="' + esc('启用 ' + p.name) + '"' + (p.enabled ? ' checked' : '') + '></td>' +
       '<td><div class="proxy-actions">' + action('check', '检测', p.checking) + action('edit', '编辑') + action('remove', p.bound_count ? '先解除账号绑定' : '删除', p.bound_count > 0) + '</div></td></tr>';
   }).join('') : '<tr><td colspan="9"><div class="empty">代理池为空</div></td></tr>');
+  // realm 级默认出口（issue #39 P3）：选项集与账号行下拉同源。
+  const realmOpts = '<option value="random">默认随机</option><option value="direct">直连</option>' +
+    list.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name + ' · ' + (PROXY_STATES[p.status]?.[1] || p.status)) + '</option>').join('');
+  for (const [id, realm] of [['proxyRealmCn', 'cn'], ['proxyRealmGlobal', 'global']]) {
+    const sel = $(id);
+    if (!sel) continue;
+    const b = (proxyData.realms || {})[realm] || { mode: 'random' };
+    const want = b.mode === 'fixed' ? b.proxy_id : b.mode;
+    sel.innerHTML = realmOpts;
+    sel.value = want;
+    if (sel.value !== want) sel.value = 'random';  // 绑的代理已删 → 显示「默认随机」
+  }
   if (!proxySettingsDirty) {
     const s = proxyData.health;
     $('proxyHealthURL').value = s.url;
@@ -5248,3 +5592,17 @@ $('proxyHealthSave').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
   finally { button.disabled = false; }
 };
+
+// realm 级默认出口（issue #39 P3）：账号绑定优先于它，两者都没有才是随机池 / 直连。
+for (const [id, realm] of [['proxyRealmCn', 'cn'], ['proxyRealmGlobal', 'global']]) {
+  if (!$(id)) continue;
+  $(id).onchange = async ev => {
+    const v = ev.target.value;
+    const body = v === 'random' || v === 'direct' ? { mode: v } : { mode: 'fixed', proxy_id: v };
+    try {
+      await api('proxies/realm/' + realm, { method: 'PUT', body: JSON.stringify(body) });
+      toast((realm === 'cn' ? '国内版' : '国际版') + '默认出口已保存', 'ok');
+    } catch (e) { toast('保存失败：' + e.message, 'err'); }
+    await loadProxies(true);
+  };
+}

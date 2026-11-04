@@ -85,7 +85,7 @@ func TestHTTPAndHTTPSProxyAuthenticationAndCONNECT(t *testing.T) {
 			id := addProxy(t, m, strings.Replace(proxy.URL, "://", "://user:secret@", 1))
 			probe(t, m, id)
 			req, _ := http.NewRequest("GET", target.URL, nil)
-			resp, err := m.Do(&http.Client{Timeout: 2 * time.Second}, req, "account")
+			resp, err := m.Do(&http.Client{Timeout: 2 * time.Second}, req, "account", "cn")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -232,7 +232,7 @@ func TestSOCKSAuthenticationAndDNSModes(t *testing.T) {
 				t.Fatal("SOCKS peer saw no target")
 			}
 			req, _ := http.NewRequestWithContext(context.Background(), "GET", settings.URL, nil)
-			resp, err := m.Do(&http.Client{Timeout: time.Second}, req, "u")
+			resp, err := m.Do(&http.Client{Timeout: time.Second}, req, "u", "cn")
 			if err != nil {
 				t.Fatal(err)
 			}

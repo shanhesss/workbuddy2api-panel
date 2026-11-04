@@ -70,6 +70,14 @@ type Binding struct {
 	ProxyID string `json:"proxy_id,omitempty"`
 }
 
+// realmKey 把 realm 归一化成配置键；只有 cn / global 合法，其余返回空（= 不匹配）。
+func realmKey(realm string) string {
+	if realm == "cn" || realm == "global" {
+		return realm
+	}
+	return ""
+}
+
 type node struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
@@ -80,6 +88,9 @@ type node struct {
 type disk struct {
 	Nodes    []node             `json:"proxies"`
 	Bindings map[string]Binding `json:"bindings"`
+	// Realms realm 级默认出口（issue #39 P3）：cn/global → 绑定，账号没有显式
+	// 绑定时取它。cn/global 的上游域名与网络环境不同，运维通常要两个出口。
+	Realms   map[string]Binding `json:"realms,omitempty"`
 	Settings Settings           `json:"health"`
 }
 
@@ -113,6 +124,7 @@ type View struct {
 type Snapshot struct {
 	Proxies  []View             `json:"proxies"`
 	Bindings map[string]Binding `json:"bindings"`
+	Realms   map[string]Binding `json:"realms"`
 	Health   Settings           `json:"health"`
 }
 
@@ -141,6 +153,7 @@ type Manager struct {
 	transports map[string]*http.Transport
 	base       *http.Transport
 	dialer     *net.Dialer
+	tlsOver    TLSOverFunc // 经代理的 HTTPS 用它在隧道上握手（SetTLSOver）；nil = net/http 原生握手
 	closed     bool
 	wake       chan struct{}
 	// Shared by periodic and manual probes, including concurrent HTTP handlers.
@@ -156,7 +169,7 @@ func New(path string, base *http.Transport, dialer *net.Dialer) (*Manager, error
 	}
 	m := &Manager{
 		path: path, base: base.Clone(), dialer: dialer,
-		data:   disk{Nodes: []node{}, Bindings: map[string]Binding{}, Settings: DefaultSettings()},
+		data:   disk{Nodes: []node{}, Bindings: map[string]Binding{}, Realms: map[string]Binding{}, Settings: DefaultSettings()},
 		health: map[string]health{}, generation: map[string]uint64{}, checking: map[string]bool{}, requested: map[string]bool{},
 		transports: map[string]*http.Transport{}, wake: make(chan struct{}, 1), slots: make(chan struct{}, 8),
 	}
@@ -269,7 +282,7 @@ func (m *Manager) Snapshot() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d := m.copyLocked()
-	s := Snapshot{Proxies: []View{}, Bindings: d.Bindings, Health: d.Settings}
+	s := Snapshot{Proxies: []View{}, Bindings: d.Bindings, Realms: d.Realms, Health: d.Settings}
 	counts := map[string]int{}
 	for _, b := range d.Bindings {
 		if b.Mode == "fixed" {
@@ -420,6 +433,11 @@ func (m *Manager) Delete(id string) error {
 			return ErrBound
 		}
 	}
+	for _, b := range m.data.Realms {
+		if b.Mode == "fixed" && b.ProxyID == id {
+			return ErrBound
+		}
+	}
 	d := m.copyLocked()
 	for i, n := range d.Nodes {
 		if n.ID == id {
@@ -470,6 +488,29 @@ func (m *Manager) Bind(uid string, b Binding) error {
 
 func (m *Manager) Unbind(uid string) error { return m.Bind(uid, Binding{Mode: "random"}) }
 
+// BindRealm 设置 realm 级默认出口（issue #39 P3）。random = 恢复「随机池」，
+// 等价于删掉这条默认；direct = 该域直连。账号级绑定优先于它。
+func (m *Manager) BindRealm(realm string, b Binding) error {
+	if realmKey(realm) == "" {
+		return errors.New("realm must be cn or global")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.validateBindingLocked(b); err != nil {
+		return err
+	}
+	d := m.copyLocked()
+	if d.Realms == nil {
+		d.Realms = map[string]Binding{}
+	}
+	if b.Mode == "random" {
+		delete(d.Realms, realmKey(realm))
+	} else {
+		d.Realms[realmKey(realm)] = b
+	}
+	return m.commitLocked(d)
+}
+
 // RequestCheck queues probes on the service lifecycle, independent of browser disconnects.
 // An empty ID requests all nodes, including manually disabled nodes.
 func (m *Manager) RequestCheck(id string) error {
@@ -509,13 +550,36 @@ func (m *Manager) Configure(s Settings) error {
 	return nil
 }
 
-func (m *Manager) selectLocked(uid string) (node, bool, error) {
+func (m *Manager) selectLocked(uid, realm string) (node, bool, error) {
 	if m.closed {
 		return node{}, false, &Error{Reason: "pool closed"}
 	}
 	b := m.data.Bindings[uid]
-	if b.Mode == "direct" || (b.Mode != "fixed" && len(m.data.Nodes) == 0) {
+	// 账号没有显式绑定时取 realm 默认出口（issue #39 P3）：查表顺序
+	// 账号绑定 > realm 默认 > 随机池 > 直连。显式 direct 依旧赢过 realm 默认。
+	if _, bound := m.data.Bindings[uid]; !bound {
+		if rb, ok := m.data.Realms[realmKey(realm)]; ok {
+			b = rb
+		}
+	}
+	// 随机绑定下「一条启用中的代理都没有」= 直连：原来只看节点条数，代理全部被手工
+	// 停用时仍进抽签、count==0，于是每个请求都 503「no healthy proxy available」
+	// （issue #150）。停用即关闭，与「一条代理都没配」同义。
+	// 只对非 fixed 生效：显式钉住的代理不可用时静默直连，等于把本机 IP 暴露给上游。
+	if b.Mode == "direct" {
 		return node{}, false, nil
+	}
+	if b.Mode != "fixed" {
+		anyEnabled := false
+		for _, n := range m.data.Nodes {
+			if n.Enabled {
+				anyEnabled = true
+				break
+			}
+		}
+		if !anyEnabled {
+			return node{}, false, nil
+		}
 	}
 	var selected node
 	count := 0

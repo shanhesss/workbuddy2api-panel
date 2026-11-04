@@ -123,6 +123,8 @@ const ctx = {
   remarkName: (uid, html) => html, // 备注是展示层增强，本测试只关心 paused 徽标/按钮
   // 账号池域分类是模块级状态（定义在 renderAccounts 之前的抽取范围外），按真实初值注入。
   accRealmFilter: 'all', lastAccountsList: [],
+  // 分组筛选是 renderAccounts 里新增的模块级状态（同上，抽取范围外）：按真实初值注入。
+  accGroupFilter: '', lastVisibleAccounts: [], syncGroupFilter: () => {},
   rateLimitRowsHtml: () => '', formatTokenCount: () => '0', formatLatency: () => '-', formatRate: () => '-',
   // 禁用原因分类与时长：定义在 renderAccounts 之前（抽取范围外），此处按真实实现注入，
   // 否则 renderAccounts 一进禁用分支就 ReferenceError。
@@ -176,6 +178,10 @@ const start = src.indexOf('const ML_STATE');
 assert.ok(start >= 0, 'ML_STATE not found');
 const host = { mlBody: { innerHTML: '' }, mlNote: { textContent: '' } };
 const ctx = { Object, Array, String, RegExp,
+  // overviewData：fallbackTargetFor 的数据源，形状与 /panel/api/overview 响应
+  // 一致（model_fallback 挂在响应对象下）；键带域前缀的场景必须能命中——
+  // 这是「已路由至」标注的核心路径。
+  overviewData: { model_fallback: { 'global:deepseek-v4.1-flash': 'deepseek-v4.1-flash-sg' } },
   $: id => host[id],
   setHTML: (el, html) => { el.innerHTML = html; },
   esc: s => String(s == null ? '' : s),
@@ -193,6 +199,10 @@ const html = host.mlBody.innerHTML;
 assert.ok(html.includes('全池锁定') && html.includes('0 / 3') && html.includes('T(2026-10-06T23:00:00+08:00)'), html);
 assert.ok(html.includes('6004 model rate limit'), html);
 assert.equal(host.mlNote.textContent, '1 个模型受限');
+// ②′ 带域前缀的降级键命中 → 行内标注「⤳ 已路由至」（锁了但请求已被改道，不是服务中断）
+ctx.render([{ model: 'deepseek-v4.1-flash', realm: 'global', state: 'locked', servable: 0, total: 2, locked: 2 }]);
+assert.ok(host.mlBody.innerHTML.includes('⤳ 已路由至 deepseek-v4.1-flash-sg'),
+  host.mlBody.innerHTML);
 // ③ 零值时间（上游没给重置时刻）→ 破折号，不显示 0001-01-01
 ctx.render([{ model: 'x', realm: 'global', state: 'partial', servable: 1, total: 2, locked: 1,
   unlock_at: '0001-01-01T00:00:00Z', fully_unlock_at: '0001-01-01T00:00:00Z', reason: '' }]);

@@ -33,7 +33,7 @@ func TestProxyAPIAuthenticationBindingAndRemoval(t *testing.T) {
 	for _, route := range []struct{ method, path string }{
 		{"GET", "proxies"}, {"POST", "proxies"}, {"PATCH", "proxies/missing"},
 		{"DELETE", "proxies/missing"}, {"POST", "proxies/check"}, {"POST", "proxies/missing/check"},
-		{"PUT", "proxies/health"}, {"PUT", "accounts/u1/proxy"},
+		{"PUT", "proxies/health"}, {"PUT", "accounts/u1/proxy"}, {"PUT", "proxies/realm/cn"},
 	} {
 		if got := call(route.method, route.path, "{}", "wrong"); got.Code != http.StatusUnauthorized {
 			t.Fatalf("unauthorized %s %s: %d", route.method, route.path, got.Code)
@@ -66,6 +66,14 @@ func TestProxyAPIAuthenticationBindingAndRemoval(t *testing.T) {
 		{"PUT", "accounts/u1/proxy", `{"mode":"fixed","proxy_id":"missing"}`, 404},
 		{"PUT", "accounts/u1/proxy", `{"mode":"bogus"}`, 400},
 		{"PUT", "proxies/health", `{"url":"file:///tmp/check","interval_seconds":60}`, 400},
+		// realm 默认出口（issue #39 P3）：只认 cn/global，绑不存在的代理 404。
+		{"PUT", "proxies/realm/cn", `{"mode":"fixed","proxy_id":"` + id + `"}`, 200},
+		{"PUT", "proxies/realm/global", `{"mode":"direct"}`, 200},
+		{"PUT", "proxies/realm/us", `{"mode":"direct"}`, 400},
+		{"PUT", "proxies/realm/global", `{"mode":"fixed","proxy_id":"missing"}`, 404},
+		// 绑了 realm 默认的代理不许直接删（删掉等于整域静默掉回随机池）。
+		{"DELETE", "proxies/" + id, "", 409},
+		{"PUT", "proxies/realm/cn", `{"mode":"random"}`, 200},
 		{"POST", "accounts/u1/remove", "", 200},
 		{"DELETE", "proxies/" + id, "", 200},
 	} {
