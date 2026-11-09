@@ -67,22 +67,27 @@ type Config struct {
 // 归档里不会出现来源字段）——来源信息比 token 计数敏感，运营可自行决定是否落盘。
 // 仍然不写提示词、响应正文、Authorization 或其它凭证。
 type Event struct {
-	Time             time.Time `json:"time"`
-	RequestID        string    `json:"request_id"`
-	Path             string    `json:"path"`
-	Account          string    `json:"account,omitempty"`
-	Model            string    `json:"model,omitempty"`
-	Status           int       `json:"status"`
-	OK               bool      `json:"ok"`
-	Outcome          string    `json:"outcome"`
-	DurationMs       int64     `json:"duration_ms"`
-	TTFBMs           int64     `json:"ttfb_ms,omitempty"`
-	Attempts         int       `json:"attempts,omitempty"`
-	PromptTokens     int64     `json:"prompt_tokens,omitempty"`
-	CompletionTokens int64     `json:"completion_tokens,omitempty"`
-	TotalTokens      int64     `json:"total_tokens,omitempty"`
-	Credit           float64   `json:"credit,omitempty"`
-	HasCredit        bool      `json:"credit_known"`
+	Time      time.Time `json:"time"`
+	RequestID string    `json:"request_id"`
+	Path      string    `json:"path"`
+	Account   string    `json:"account,omitempty"`
+	Model     string    `json:"model,omitempty"`
+	// ModelEff 模型降级（pool.model_fallback / model_unavailable_fallback）后**实际
+	// 使用**的模型（2026-10-25 实案）：只记 Model 会让「global:deepseek-v4.1-flash」
+	// 与实际在跑的「deepseek-v4.1-flash-sg」归为一类——两者计价/能力都不同，
+	// 归档与面板请求记录必须分开可辨。空 = 未降级。
+	ModelEff         string  `json:"model_eff,omitempty"`
+	Status           int     `json:"status"`
+	OK               bool    `json:"ok"`
+	Outcome          string  `json:"outcome"`
+	DurationMs       int64   `json:"duration_ms"`
+	TTFBMs           int64   `json:"ttfb_ms,omitempty"`
+	Attempts         int     `json:"attempts,omitempty"`
+	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64   `json:"completion_tokens,omitempty"`
+	TotalTokens      int64   `json:"total_tokens,omitempty"`
+	Credit           float64 `json:"credit,omitempty"`
+	HasCredit        bool    `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92 同步）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
 	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
@@ -322,7 +327,7 @@ func newArchiveWriter(cfg Config) *archiveWriter {
 	w := &archiveWriter{
 		cfg:     cfg,
 		ch:      make(chan Event, cfg.QueueSize),
-		purgeCh: make(chan chan PurgeResult, 1),
+		purgeCh: make(chan chan PurgeResult),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -515,8 +520,6 @@ func (w *archiveWriter) closeFile() {
 	w.size = 0
 }
 
-// purge 把清空请求交给写循环并等它做完。归档已停止（done 关闭）时直接返回错误，
-// 否则往没人收的通道里发会永久阻塞调用方（HTTP handler 卡死）。
 // drain 把写入队列里已入队的事件全部写掉（非阻塞，队列空即返回）。
 func (w *archiveWriter) drain() {
 	for {
@@ -529,6 +532,11 @@ func (w *archiveWriter) drain() {
 	}
 }
 
+// purge 把清空请求交给写循环并等它做完。归档已停止（done 关闭）时直接返回错误，
+// 否则会永久阻塞调用方（HTTP handler 卡死）。
+//
+// purgeCh 必须无缓冲：发送成功就说明写循环已经收下请求，它一定会回结果。带缓冲时，
+// 写循环退出后（或正选中 stop 分支时）请求照样能发进通道却没人处理，<-out 永远等不到。
 func (w *archiveWriter) purge() (PurgeResult, error) {
 	if !w.enabled() {
 		return PurgeResult{}, nil
@@ -819,7 +827,7 @@ func (f Filter) match(e Event) bool {
 	if !containsFold(e.Account, f.Account) {
 		return false
 	}
-	if !containsFold(e.Model, f.Model) {
+	if !containsFold(e.Model, f.Model) && !containsFold(e.ModelEff, f.Model) {
 		return false
 	}
 	if !containsFold(e.ClientIP, f.ClientIP) {

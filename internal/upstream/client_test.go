@@ -150,6 +150,12 @@ func TestClassify(t *testing.T) {
 		{429, `{"code":1,"msg":"too many requests"}`, ErrSoftRate},
 		{429, `{"requestId":"6021","msg":"rate limit"}`, ErrSoftRate},
 		{429, `{"requestId":"6020","msg":"rate limit"}`, ErrSoftRate},
+		// 11134「model provider is temporarily unavailable」：供应商过载，与账号无关。
+		// 落 ErrServer 会按 5xx 罚号 + 换号，而换号撞同一 provider 且打断账号级前缀缓存
+		// （issue #188）。认结构化 code；只有文案、没有 code 的仍是普通 5xx。
+		{500, `{"code":11134,"msg":"the model provider is temporarily unavailable, please retry later or switch to another model","requestId":"01a1b4d1b3f45f4b99c406eb04d68909","retry_policy":{"retry":true,"retry_after":8}}`, ErrUpstreamBusy},
+		{503, `{"code":11134,"msg":"the model provider is temporarily unavailable"}`, ErrUpstreamBusy},
+		{500, `{"msg":"the model provider is temporarily unavailable"}`, ErrServer},
 		// 11148 工具配对断裂：请求内容级（上游「直接重试无效，请新建任务」），
 		// 换号/重试必然同样失败——不得落 ErrClient 白轮转全池。
 		{400, `{"code":11148,"msg":"tool calls and tool results do not match"}`, ErrToolMismatch},
@@ -158,6 +164,14 @@ func TestClassify(t *testing.T) {
 		// 防过宽：相邻错误码不误伤（11140 账号级风控、11115 超长各有归属）。
 		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
 		{400, `{"code":11115,"msg":"prompt is too long"}`, ErrPromptTooLong},
+		// 11151 空 text 段（a message has empty content）：请求内容级，出站前由
+		// empty_text_part.go 补位；真打到这里说明补位没覆盖，也不能轮转全池。
+		{400, `{"code":11151,"msg":"a message has empty content"}`, ErrEmptyContent},
+		{400, `{"code": 11151 , "msg":"a message has empty content"}`, ErrEmptyContent},
+		// 只认结构化 code：文案单独出现不算（用户自己的消息里可能就有这句）。
+		{400, `{"msg":"a message has empty content"}`, ErrClient},
+		// 非 400 不认（上游目前只用 400，放宽会让别的状态码误入不轮转通道）。
+		{500, `{"code":11151,"msg":"a message has empty content"}`, ErrServer},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
@@ -243,6 +257,9 @@ func TestParseQueueRetryAfter(t *testing.T) {
 		{"6020 真机形态", `{"code":6020,"msg":"queue.waiting.title","requestId":"01a181ca3b67934d01c3f64599c8490c","data":{"queue_position":2502,"queue_size":"999+","retry_after":40,"estimated_wait":12510}}`, 40 * time.Second, true},
 		{"retry_after=0（不该出现的边界）", `{"code":6020,"data":{"retry_after":0}}`, 0, false},
 		{"6021 无 data（queue.full 无等待口径）", `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea"}`, 0, false},
+		// 11134 供应商过载：口径在 retry_policy.retry_after（issue #188 生产实测形态）。
+		{"11134 retry_policy 形态", `{"code":11134,"msg":"the model provider is temporarily unavailable, please retry later or switch to another model","requestId":"01a1b4d1b3f45f4b99c406eb04d68909","retry_policy":{"retry":true,"retry_after":8}}`, 8 * time.Second, true},
+		{"11134 retry_policy 无 retry_after", `{"code":11134,"msg":"model unavailable","retry_policy":{"retry":true}}`, 0, false},
 		{"非 JSON", `upstream unavailable`, 0, false},
 		{"空 body", ``, 0, false},
 	}

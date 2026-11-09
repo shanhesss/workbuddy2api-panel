@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"strings"
+	"sync/atomic"
 )
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
@@ -32,6 +33,17 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	body, _ := PrepareBodyOptWithEffortsDefaultAndCaps(src, sanitize, efforts, defaultEfforts, nil)
 	return body
 }
+
+// prepareBodyParses 记录 prepareBodyOpt 对请求体的整树解析次数（观测/回归用）。
+// 每个 chat 请求在这里只应解析一次：会话键、首条 role、kimi 工具、会话字段
+// 注入都已各自走零分配扫描或并入本次解析。
+var prepareBodyParses atomic.Int64
+
+// PrepareBodyParseCount 返回累计整树解析次数（供测试与面板观测）。
+func PrepareBodyParseCount() int64 { return prepareBodyParses.Load() }
+
+// ResetPrepareBodyParseCount 归零计数（供测试）。
+func ResetPrepareBodyParseCount() { prepareBodyParses.Store(0) }
 
 // SplitRealmPrefix 解析网关的 realm 前缀协议（"[realm:]model"）：
 // 取第一个 ":"，前段恰为 "cn"/"global" 才剥离；否则视为裸名，realm 回落 "cn"。
@@ -67,7 +79,7 @@ func normalizeModelName(obj map[string]any) {
 // 导出入口不注入 prompt_cache_key（保持既有公开语义）；生产路径由
 // client.prepareBody 调用 prepareBodyOpt 并传入 cache 参数。
 func PrepareBodyOptWithEffortsDefaultAndCaps(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64) ([]byte, string) {
-	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, "", nil, "", "", false, 0)
+	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, "", nil, "", "", false, 0, "")
 	return body, eff
 }
 
@@ -77,7 +89,7 @@ func PrepareBodyOptWithEffortsDefaultAndCaps(src []byte, sanitize bool, efforts 
 // realm 用于 thinking.model_defaults 的 "realm:model" 精确匹配；policy 为 nil
 // 或未启用时与 …Caps 完全一致。
 func PrepareBodyOptWithEffortPolicy(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64, realm string, policy *EffortPolicy) ([]byte, string) {
-	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, realm, policy, "", "", false, 0)
+	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, realm, policy, "", "", false, 0, "")
 	return body, eff
 }
 
@@ -88,10 +100,11 @@ func PrepareBodyOptWithEffortPolicy(src []byte, sanitize bool, efforts map[strin
 //   - requested 在 injectThinking 之前抓取，因此不含网关补的默认档——它回答
 //     「客户端到底发没发、发的哪一档」（issue #43/#18 的判别依据）；
 //   - effective 是降级后的出站档位，未携带/未知模型/未知档位 → ""。
-func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64, realm string, policy *EffortPolicy, cacheUID, cacheConversation string, injectCache bool, keepRounds int) ([]byte, string, string) {
+func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64, realm string, policy *EffortPolicy, cacheUID, cacheConversation string, injectCache bool, keepRounds int, convReqID string) ([]byte, string, string) {
 	if len(src) == 0 {
 		return src, "", ""
 	}
+	prepareBodyParses.Add(1)
 	var obj map[string]any
 	if err := json.Unmarshal(src, &obj); err != nil {
 		return src, "", ""
@@ -163,14 +176,34 @@ func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][
 		// 也可能返回空）。
 		effort = policyEffort
 	}
+	// 输出预算下限（见 output_budget.go）：客户端既要高档位思考、又把 max_tokens
+	// 给得比「这一档的思考都装不下」还小的时候，抬到该档的下限。抬的是上限不是
+	// 目标长度——模型写完了照样停，只是不再被思考挤掉正文。
+	ensureMinOutputBudget(obj, effort, maxOut)
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
+	// 出站前最后一道形状检查，两条都是「不可自愈的 400」：
+	//   - 空 text 段（11151）：客户端重试只会重放同一段历史，换号也救不回来；
+	//   - reasoning 镜像：Kimi/GLM/MiniMax 等按 `reasoning` 读历史，只看
+	//     reasoning_content 的话它们的多轮一致性校验会挂。
+	// 位置必须在 repack/cleanup 之后：那两步会把字符串 content 挪到别的消息上，
+	// 先补位再挪动等于漏掉被挪过去的那一段。
+	if msgs, ok := obj["messages"].([]any); ok {
+		guardEmptyTextParts(msgs)
+	}
+	mirrorUpstreamReasoning(obj)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs, brandGlobal)
 		}
+		// tools 是客户端自带的能力声明，描述由客户端作者撰写，同样会带身份句
+		// （上游 issue：只洗 messages 时整段工具描述原样出站）。issue #395 同类。
+		sanitizeTools(obj["tools"], brandGlobal)
 	}
+	// 会话轮级字段（issue #51）：本轮已解析好的 map 就地补，与本函数的序列化合并；
+	// 旧实现是在 prepared body 上再 Unmarshal+Marshal 一次（100~500KB 的整树往返）。
+	injectConversationFieldsObj(obj, convReqID)
 	// prompt_cache_key：与 body 改写共用同一次 map，避免再 Unmarshal/Marshal 一遍。
 	if injectCache {
 		if key, ok := promptCacheKeyFor(obj, cacheUID, cacheConversation); ok {
@@ -556,9 +589,18 @@ func dropReasoningContentParts(obj map[string]any) {
 	obj["messages"] = out
 }
 
+// consoleSystemFallback 兜底 system 正文：只写行为约定，不写身份（issue #187）。
+const consoleSystemFallback = "Follow the user's instructions and respond in the user's language."
+
 // ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
-// 首条消息非 system 时在 messages 最前补一条 fallback system（"You are a helpful assistant."）。
-// 仅对 global 请求调用（CN 现状不动；即使首条就是 system 也不重复注入）。
+// 首条消息非 system 时在 messages 最前补一条 fallback system。仅对 global 请求调用
+// （CN 现状不动；即使首条就是 system 也不重复注入）。
+//
+// 兜底文本**不声明身份**（issue #187）：上游的判据只是「首条必须是 system」，正文不参与
+// 校验；写成「You are a helpful assistant.」等于网关自己往对话里插一句身份声明，与客户端
+// harness 自带的人设并列时，模型会把它当成外部注入而拒绝执行。这里只声明行为约定，
+// 不碰身份。
+//
 // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不在这里二次错误化）。
 func ensureConsoleSystem(body []byte) []byte {
 	if len(body) == 0 {
@@ -578,7 +620,7 @@ func ensureConsoleSystem(body []byte) []byte {
 			return body // 首条已是 system：不注入
 		}
 	}
-	obj["messages"] = append([]any{map[string]any{"role": "system", "content": "You are a helpful assistant."}}, msgs...)
+	obj["messages"] = append([]any{map[string]any{"role": "system", "content": consoleSystemFallback}}, msgs...)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body

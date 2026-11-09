@@ -58,3 +58,6 @@ server.exe
 
 # Local tooling artifacts
 .qoder-credits/
+
+# Local build artifacts (local-45/build.sh 的产物，不进仓库)
+/local-45/dist/

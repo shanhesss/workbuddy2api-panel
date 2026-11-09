@@ -6,6 +6,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -13,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/misakano7545/workbuddy2api-panel/internal/debugcap"
 )
 
 // responsesWebsocketUnsupported 回应 Codex 的 WS 升级探测（GET /v1/responses）。
@@ -25,9 +28,9 @@ func (h *Handler) responsesWebsocketUnsupported(w http.ResponseWriter, r *http.R
 }
 
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+	body, berr := h.readBody(w, r)
+	if berr != nil {
+		h.writeBodyError(w, berr, false)
 		return
 	}
 	chat, meta, srv, err := responsesToChat(body)
@@ -35,21 +38,43 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// stream 标志在增强前后不变（增强只追加 messages），先建回程写入器：下面的积分闸
+	// 要和 chatCompletions 里的拒绝走同一条回程（流式请求的拒绝也折成 response.failed）。
+	var peek struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(chat, &peek)
+	rw := &responsesWriter{ResponseWriter: w, stream: peek.Stream, meta: meta}
+	defer rw.finish()
+	// 声明了托管 image_generation 的请求，探测 + 出图（真扣积分）都发生在 chatCompletions
+	// 的积分闸之前：闸要提前到这里，否则到顶后仍会白出一张图，对话那一步才被拒、图丢了。
+	ctx := r.Context()
+	if meta.imageTool {
+		if !h.admitBudget(rw) {
+			return
+		}
+		// 已经放行：出图会把累计推高，对话一步不能再按新累计把整个请求拒掉（见 budgetAdmittedKey）。
+		ctx = context.WithValue(ctx, budgetAdmittedKey{}, true)
+	}
 	// 声明了托管 web_search → 网关侧执行（探测→检索→结果注入，同 /v1/messages）。
 	if len(srv) > 0 {
 		if augmented, _ := h.searchAugment(r.Context(), chat, srv[0]); augmented != nil {
 			chat = augmented
 		}
 	}
-	var peek struct {
-		Stream bool `json:"stream"`
+	// 声明了托管 image_generation → 网关出图，成品作为输出项补进回程（见 imagetool.go）。
+	if meta.imageTool {
+		if augmented, items := h.imageAugment(r.Context(), chat); augmented != nil {
+			chat, meta.preItems = augmented, items
+		}
+		if r.Context().Err() != nil { // 探测或出图期间客户端走了：不再跑对话，也不写任何回程
+			rw.abort(499)
+			return
+		}
 	}
-	_ = json.Unmarshal(chat, &peek)
-	r2 := r.Clone(r.Context())
+	r2 := r.Clone(ctx)
 	r2.Body = io.NopCloser(bytes.NewReader(chat))
 	r2.ContentLength = int64(len(chat))
-	rw := &responsesWriter{ResponseWriter: w, stream: peek.Stream, meta: meta}
-	defer rw.finish()
 	h.chatCompletions(rw, r2)
 }
 
@@ -82,12 +107,18 @@ func responsesToChat(src []byte) ([]byte, *responsesMeta, []serverSearchTool, er
 	var srv []serverSearchTool
 	if tools, ok := obj["tools"].([]any); ok {
 		chatTools, custom, nsMap, alias := convertTools(tools)
-		// 托管 web_search 由网关执行，不进上游 tools（见 splitHostedSearch）。
-		chatTools, srv = splitHostedSearch(chatTools)
+		// 托管 web_search / image_generation 由网关执行，不进上游 tools（见 splitHostedTools）。
+		var image bool
+		chatTools, srv, image = splitHostedTools(chatTools)
+		meta.imageTool = image
 		if len(chatTools) > 0 {
 			out["tools"] = chatTools
 		}
 		meta.customTools, meta.nsMap, meta.alias = custom, nsMap, alias
+		meta.toolsDeclared = len(chatTools)
+	}
+	if _, ok := out["tool_choice"]; ok {
+		meta.toolChoiceSet = true
 	}
 	// tool_choice 也要与出站工具名对齐：重名改名过的工具，客户端仍按原名点名。
 	if v, ok := out["tool_choice"]; ok {
@@ -113,29 +144,35 @@ func responsesToChat(src []byte) ([]byte, *responsesMeta, []serverSearchTool, er
 	return b, meta, srv, nil
 }
 
-// splitHostedSearch 分离 Responses 的托管联网工具，返回留在上游 tools 里的部分。
+// splitHostedTools 分离 Responses 的托管工具（web_search / image_generation），返回
+// 留在上游 tools 里的部分。
 //
 // Codex 开 tools.web_search 时声明的是托管工具 {"type":"web_search"}（或
 // web_search_preview 变体），没有 name/parameters。上游收下不报错（实测 200）但也
 // 不会执行——留着就是空转；本网关有执行器（searchtool.go），故摘出来自己跑，
 // 由 searchAugment 拼一份 function 声明送给模型。其余托管类型（code_interpreter 等）
 // 原样保留：上游对未知 type 不报错，改它没有证据支撑。
-func splitHostedSearch(tools []any) ([]any, []serverSearchTool) {
+func splitHostedTools(tools []any) ([]any, []serverSearchTool, bool) {
 	kept := make([]any, 0, len(tools))
 	var srv []serverSearchTool
+	var imageTool bool
 	for _, t := range tools {
 		m, ok := t.(map[string]any)
 		if !ok || asString(m["name"]) != "" {
 			kept = append(kept, t)
 			continue
 		}
-		if !strings.HasPrefix(asString(m["type"]), webSearchToolName) {
+		typ := asString(m["type"])
+		switch {
+		case strings.HasPrefix(typ, webSearchToolName):
+			srv = append(srv, serverSearchTool{Name: webSearchToolName, MaxUses: int(asNum(m["max_uses"]))})
+		case strings.HasPrefix(typ, imageToolName):
+			imageTool = true
+		default:
 			kept = append(kept, t)
-			continue
 		}
-		srv = append(srv, serverSearchTool{Name: webSearchToolName, MaxUses: int(asNum(m["max_uses"]))})
 	}
-	return kept, srv
+	return kept, srv, imageTool
 }
 
 // responsesMeta 请求阶段提取、回程需要的工具语义（PR #109 的两条 Codex 协议细节）：
@@ -147,6 +184,14 @@ func splitHostedSearch(tools []any) ([]any, []serverSearchTool) {
 type responsesMeta struct {
 	customTools map[string]bool
 	nsMap       map[string]string
+	// imageTool 客户端声明了托管 image_generation：回程要补 image_generation_call 输出项。
+	imageTool bool
+	// preItems 网关侧已执行完的托管工具产出（image_generation_call），按序排在 output 最前。
+	preItems []any
+	// toolsDeclared 出站声明的工具数（取证用：判断「声明了工具却零调用」的形态）。
+	toolsDeclared int
+	// toolChoiceSet 客户端是否显式带了 tool_choice（取证用：none 会让网关删掉 tools）。
+	toolChoiceSet bool
 	// alias 出站扁平名 -> 客户端原名（只对重名改名过的有值）。
 	// namespace 组内（或与顶层）重名时子工具被改成稳定后缀名（read_file_2），回程必须
 	// 还原成客户端声明的原名，否则客户端下一轮按自己声明的名字回传工具结果就匹配不上；
@@ -811,6 +856,11 @@ func chatCompletionToResponse(obj map[string]any, meta *responsesMeta) map[strin
 			output = append(output, item)
 		}
 	}
+	// 网关侧已执行完的托管工具产出（image_generation_call）排在最前：它们在对话开始
+	// 之前就完成了，客户端按序渲染。
+	if meta != nil && len(meta.preItems) > 0 {
+		output = append(append([]any{}, meta.preItems...), output...)
+	}
 	// 非流式同样不允许 output:null（nil 切片）：空响应是合法形态。
 	if output == nil {
 		output = []any{}
@@ -872,6 +922,13 @@ type responsesWriter struct {
 	body    []byte
 	x       streamState
 	meta    *responsesMeta
+	aborted bool // 客户端已走：finish 什么都不写（否则流式会补一条 200 + response.failed，被记成成功）
+}
+
+// abort 客户端已断开时收尾：把状态码直接交给底层写入器（请求统计据此记 499），之后不再写任何内容。
+func (w *responsesWriter) abort(code int) {
+	w.aborted, w.status = true, code
+	w.ResponseWriter.WriteHeader(code)
 }
 
 type streamState struct {
@@ -946,6 +1003,9 @@ func (w *responsesWriter) Write(p []byte) (int, error) {
 }
 
 func (w *responsesWriter) finish() {
+	if w.aborted {
+		return
+	}
 	if w.stream {
 		if strings.Contains(w.Header().Get("Content-Type"), "event-stream") || w.hdrSent {
 			if w.x.created && !w.x.completed && !w.x.failed {
@@ -987,8 +1047,58 @@ func (w *responsesWriter) flushJSON() {
 		_, _ = w.ResponseWriter.Write(w.body)
 		return
 	}
+	// 非流式同一条判据：只有思考、没有正文与工具调用 → 502 让客户端重试，不再回
+	// 一个「成功但内容为空」的 Responses 对象（客户端会把空 output 当模型没话说的
+	// 正常收尾）。流式侧见 emitCompleted 的同名判定。
+	if responsesReasoningOnly(raw) {
+		log.Printf("WARN: [responses] 非流式：上游只返回思考、正文与工具调用皆空 → 502 empty_reasoning_only（交客户端重试）")
+		writeOpenAIError(w.ResponseWriter, http.StatusBadGateway, "empty_reasoning_only",
+			"upstream returned reasoning without output text; retry")
+		return
+	}
 	w.ResponseWriter.WriteHeader(status)
 	_, _ = w.ResponseWriter.Write(raw)
+}
+
+// responsesReasoningOnly 判定序列化后的 Responses 对象是否「只有 reasoning item」：
+// output 里既没有非空正文也没有任何工具调用，但至少有一个 reasoning item。与流式侧
+// 的 reasoningOnlyNoOutput 同口径，只是这里只能看成品 JSON。
+//
+// message 要按**文本内容**判，不能只看 type：chatCompletionToResponse 对空正文也会
+// 产出一个 {"type":"message","content":[{"text":""}]} 的壳，只看 type 会把它当成
+// 有效输出、永远不触发。
+func responsesReasoningOnly(raw []byte) bool {
+	var obj struct {
+		Output []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+		OutputText string `json:"output_text"`
+	}
+	if json.Unmarshal(raw, &obj) != nil {
+		return false
+	}
+	if strings.TrimSpace(obj.OutputText) != "" {
+		return false
+	}
+	hasReasoning := false
+	for _, it := range obj.Output {
+		switch it.Type {
+		case "reasoning":
+			hasReasoning = true
+		case "message":
+			for _, c := range it.Content {
+				if strings.TrimSpace(c.Text) != "" {
+					return false
+				}
+			}
+		case "function_call", "custom_tool_call", "web_search_call", "local_shell_call":
+			return false
+		}
+	}
+	return hasReasoning
 }
 
 func (w *responsesWriter) emitJSONErrorAsFailed() error {
@@ -1049,6 +1159,9 @@ func (w *responsesWriter) handleChunk(obj map[string]any) error {
 				"output":     []any{},
 			},
 		}); err != nil {
+			return err
+		}
+		if err := w.emitPreItems(); err != nil {
 			return err
 		}
 	}
@@ -1465,9 +1578,64 @@ func (w *responsesWriter) closeMessage() error {
 	return nil
 }
 
+// emitPreItems 补发网关侧已执行完的托管工具产出（image_generation_call）：图是在对话
+// 开始前就出好的，added 用 in_progress 占位、done 带成品，与 OpenAI 的事件形状一致。
+func (w *responsesWriter) emitPreItems() error {
+	if w.meta == nil {
+		return nil
+	}
+	for _, it := range w.meta.preItems {
+		item, _ := it.(map[string]any)
+		if item == nil {
+			continue
+		}
+		idx := w.nextIdx()
+		head := map[string]any{"id": item["id"], "type": item["type"], "status": "in_progress"}
+		if err := w.emit("response.output_item.added", map[string]any{"output_index": idx, "item": head}); err != nil {
+			return err
+		}
+		if err := w.emit("response.output_item.done", map[string]any{"output_index": idx, "item": item}); err != nil {
+			return err
+		}
+		w.x.output = append(w.x.output, item)
+	}
+	return nil
+}
+
 func (w *responsesWriter) emitCompleted() error {
 	if w.x.completed || w.x.failed {
 		return nil
+	}
+	// 上游把整轮预算花在思考上、正文与工具调用全空：说 response.completed 等于告诉
+	// 客户端「模型想完了、没什么要说的」，Codex 这类 Agent 就此收尾，用户看到的是
+	// 一条空回复、只能自己再催一句（线上高频形态；也是 issue #508 的同一判据）。
+	// 这里改成 response.failed，客户端据自己的重试策略重来一次——与「只有思考没正文」
+	// 是失败而非答案这一事实一致。
+	// 判据与 hub 实现一致（wb_proxy.reasoning_only_response）：无正文、无工具调用、
+	// 有思考、且不是 length 截断（截断走 incomplete，不抢占）。
+	// 取证（默认关闭）：声明了工具、却只回了正文就收尾 —— 用户看到的是「说一句就停，
+	// 要人喊继续」。这条形态的成因（模型自己选择、还是客户端 tool_choice、还是出站被
+	// 改写）无法从元数据判断，抓一条真实正文与出站形态比在生产上试参数可靠。
+	// 只在 WB2API_CAPTURE_DIR 设了目录时才写盘，且每个 tag 有硬上限（见 debugcap）。
+	if debugcap.Enabled() && w.meta != nil && w.meta.toolsDeclared > 0 && len(w.x.toolOrder) == 0 {
+		if text := strings.TrimSpace(w.x.messageText.String()); text != "" {
+			debugcap.Capture("stop-no-toolcall", map[string]any{
+				"time":            debugcap.Now(),
+				"model":           w.x.model,
+				"tools_declared":  w.meta.toolsDeclared,
+				"tool_choice_set": w.meta.toolChoiceSet,
+				"text_len":        len(text),
+				"text":            text,
+				"usage":           w.x.usage,
+			})
+		}
+	}
+	if w.reasoningOnlyNoOutput() {
+		return w.emitFailed(map[string]any{
+			"code":    "empty_reasoning_only",
+			"type":    "upstream_error",
+			"message": "upstream returned reasoning without output text; retry",
+		})
 	}
 	w.x.completed = true
 	typ, status := "response.completed", "completed"
@@ -1497,6 +1665,24 @@ func (w *responsesWriter) emitCompleted() error {
 		resp["usage"] = convertUsage(w.x.usage)
 	}
 	return w.emit(typ, map[string]any{"response": resp})
+}
+
+// reasoningOnlyNoOutput 本轮是否「只有思考、没有正文与工具调用」。
+//
+// 判据（与 hub 的 reasoning_only_response 同口径）：正文空、无工具调用、有思考、
+// 且不是 finish_reason=length 的截断（截断走 incomplete，不能在这里抢成 failed，
+// 否则客户端会把「额度用尽」误读成「上游故障」）。
+func (w *responsesWriter) reasoningOnlyNoOutput() bool {
+	if w.x.status == "incomplete" {
+		return false
+	}
+	if strings.TrimSpace(w.x.messageText.String()) != "" {
+		return false
+	}
+	if len(w.x.toolOrder) > 0 {
+		return false
+	}
+	return strings.TrimSpace(w.x.reasoningText.String()) != ""
 }
 
 func (w *responsesWriter) emitFailed(errObj any) error {

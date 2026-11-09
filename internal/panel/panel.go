@@ -712,9 +712,11 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 出图模型：目录按 tag 把它们从**对话**列表剔掉了（/v1/models 同样单列），面板
+	// 出图/出视频模型：目录按 tag 把它们从**对话**列表剔掉了（/v1/models 同样单列），面板
 	// 「模型与档位」也必须看得到——否则用户不知道有哪些能调。字段与对话模型同口径，
-	// 另加 image_generation 标记（前端据此标「出图」）。视频不列：没有网关端点。
+	// 另加 image_generation / video_generation 标记（前端据此标「出图」「出视频」）。
+	// 视频端点 2026-11 起已实现（POST /v1/videos/generations + GET /v1/videos/{id}），
+	// 所以视频模型与出图模型同一个口径列出；出图专有的分档实扣（charge_variants）只对 image 生效。
 	//
 	// 倍率口径（2026-10-22 复测，两个个人号直连上游）：
 	//   - 目录**不再给出图模型报 credits**：CN hunyuan-image-alpha 的条目只有
@@ -741,17 +743,21 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for _, mi := range p.cfg.Upstream.GenerationModels(realm) {
-			if mi.GenerationKind != "image" {
+			if mi.GenerationKind != "image" && mi.GenerationKind != "video" {
 				continue
 			}
 			e := panelModelEntry(realm, mi, nil, "", p.cfg.Upstream.HTTP)
-			e["image_generation"] = true
+			if mi.GenerationKind == "video" {
+				e["video_generation"] = true
+			} else {
+				e["image_generation"] = true
+			}
 			// 有牌价也照样带实测（此前只在 credits 为空时才带，导致 CN 的 5.71 被
 			// x5.00 盖住、用户看到的价格比实付低）。
 			if v, ok := measured[realm+":"+mi.ID]; ok {
 				e["measured_credit"] = v
 			}
-			if variants := p.cfg.Upstream.ImageCharges(realm, mi.ID); len(variants) > 0 {
+			if variants := p.cfg.Upstream.ImageCharges(realm, mi.ID); mi.GenerationKind == "image" && len(variants) > 0 {
 				e["charge_variants"] = variants
 				last := variants[0]
 				for _, v := range variants {
@@ -828,6 +834,12 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"models": p.withLiveFlags(out),
+		// fetch_errors 分域取数失败清单（域成功但另一域失败时也要让前端看到——
+		// 否则 global 探测失败（如 DNS 抖动 → 5min 负缓存）时页面只剩 CN 模型，
+		// 用户不知道国际模型「为什么没了」。2026-10-25 实案。
+		// 上游已把单一的 fetchErrs 拆成 catalogErrs / busyErrs，这里取目录失败即可
+		// （繁忙度失败另有 busy_errs，前端单独提示）。
+		"fetch_errors": catalogErrs,
 		// global_source global 目录来源（v3-desktop / v3-union / enterprise）。
 		// 前端据此提示「拿到的是回落/降级目录」——issue #216 里用户只看到「少了 11 个模型」，
 		// 完全不知道已经降级到企业端点（那份目录只有 18 条、hy4-preview 的倍率还是旧值）。
@@ -1133,7 +1145,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		p.cfg.Pool.NoteCheckinDone(uid)
 		checkinDone = true
 	}
-	resp := map[string]any{"ok": checkinDone, "realm": "cn", "checkin_done": checkinDone}
+	// realm 取账号真值，不写字面量：上面 global 分支一旦被改（提前返回挪走、门控放宽），
+	// 这里硬写的 "cn" 会让国际号拿到错误回显。
+	resp := map[string]any{"ok": checkinDone, "realm": a.Realm(), "checkin_done": checkinDone}
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
 	}

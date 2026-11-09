@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 func TestDefault(t *testing.T) {
@@ -1103,8 +1105,10 @@ func TestThinkingDefaults(t *testing.T) {
 	if !c.Thinking.Enabled {
 		t.Error("thinking.enabled default should be true")
 	}
-	if c.Thinking.DefaultEffort != "max" {
-		t.Errorf("thinking.default_effort=%q want max", c.Thinking.DefaultEffort)
+	// 缺省 high（upstream.DefaultGatewayEffort），不是 max：思考与正文共用一份输出
+	// 额度，max 会把预算烧在思考上、正文只剩半句。
+	if c.Thinking.DefaultEffort != upstream.DefaultGatewayEffort {
+		t.Errorf("thinking.default_effort=%q want %q", c.Thinking.DefaultEffort, upstream.DefaultGatewayEffort)
 	}
 	if !c.Thinking.ClientPriority {
 		t.Error("thinking.client_priority default should be true")
@@ -1177,7 +1181,10 @@ func TestConfigExampleParses(t *testing.T) {
 	if err := cfg.normalizeThinking(); err != nil {
 		t.Fatalf("normalize example thinking: %v", err)
 	}
-	if !cfg.Thinking.Enabled || !cfg.Thinking.ClientPriority || cfg.Thinking.OverrideScope != "level" || cfg.Thinking.DefaultEffort != "max" {
+	// default_effort 期望 high 而不是 max：思考与正文共用一份输出额度，max 会把预算
+	// 烧在思考上、正文只剩半句（实测 max 正文 1906 token vs high 3236 token）。
+	// 与 hub 的 WB_DEFAULT_REASONING_EFFORT 默认值同口径（issue #508）。
+	if !cfg.Thinking.Enabled || !cfg.Thinking.ClientPriority || cfg.Thinking.OverrideScope != "level" || cfg.Thinking.DefaultEffort != "high" {
 		t.Fatalf("unexpected example thinking defaults: %+v", cfg.Thinking)
 	}
 }

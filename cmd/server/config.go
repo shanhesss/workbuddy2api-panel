@@ -82,6 +82,12 @@ type Config struct {
 		// 时限）。长流式 SSE 合法时长可达分钟级，固定 5s 必然把在途请求掐成
 		// 连接重置。缺省 "30s"；"0" = 不等待直接退。改动需重启进程。
 		ShutdownTimeout string `json:"shutdown_timeout"`
+		// MaxPayloadBytes 入站请求体安全上限（字节），缺省 67108864（64 MiB）。
+		// 这不是「大请求预拦截」：旧的 8 MB 紧上限因为多图/长会话被移除过（大请求
+		// 交上游自然响应）。这里只挡「大到能把进程读死」的上传——读体是 io.ReadAll
+		// 无界的，一次几百 MB 的 body 就能把网关 OOM 掉。允许范围 8–512 MiB；
+		// 改动需重启进程。超限回 413（OpenAI 形状 / Anthropic 形状各自适配）。
+		MaxPayloadBytes int64 `json:"max_payload_bytes"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -253,6 +259,12 @@ type Config struct {
 		// 长会话把 tools 定义排在几百条 messages 之后，256 KB 常在中途截断，
 		// 排障时看不到工具声明（issue #44 的反馈）。0 = 用默认值。
 		DumpMaxBytes int `json:"dump_max_bytes"`
+		// RestrictionHoldSeconds 11140 风控连坐的全池暂停时长（秒），缺省 1800。
+		// 上游把「账号存在异常行为」判在设备/出口上：一个请求顺着换号打下去会把
+		// 一串账号送进风控。命中 11140 网关一律就地停手（不换号）；同一 15 分钟窗
+		// 内出现 2 个不同账号被限制时，再全池暂停这么久（期间 503 + Retry-After）。
+		// 0 = 关掉全池暂停，只保留「命中即停手」。改动需重启进程。
+		RestrictionHoldSeconds int `json:"restriction_hold_seconds"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -267,6 +279,16 @@ type Config struct {
 		// 关闭时端点仍在，但回 403 embeddings_disabled（而不是 404：让调用方看得出
 		// 「功能存在、只是没开」，不用去猜路径拼错）。
 		EmbeddingsEnabled bool `json:"embeddings_enabled"`
+
+		// WatermarkStripEnabled 实验特性：水印裁切端点 POST /v1/images/strip-watermark
+		// 与 MCP 工具 strip_watermark 的总开关，默认 false。
+		//
+		// 为什么默认关：这条链路要把成品图回读、解码、裁、再以 base64 回传（一张
+		// 1024x1536 的 PNG 约 2.5MB → base64 3.4MB），只在「成品要彻底去水印」时划算；
+		// 而且它依赖提示词真的留出底部白边（实测模型只肯给 25~38%，深色桌面那张给了
+		// 1%），所以不适合当默认行为。关闭时端点回 403 watermark_strip_disabled，
+		// MCP 工具不出现在 tools/list 里。面板保存后经 livecfg 热生效。
+		WatermarkStripEnabled bool `json:"watermark_strip_enabled"`
 	} `json:"features"`
 
 	Models struct {
@@ -497,6 +519,8 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Server.ShutdownTimeout = "30s"
+	c.Server.MaxPayloadBytes = 64 << 20
+	c.Upstream.RestrictionHoldSeconds = 1800
 	c.Panel.PackageDetailLimit = 5
 	c.Update.AutoTime = "04:00"
 	c.Logging.RequestArchiveEnabled = true
@@ -536,7 +560,7 @@ func Default() *Config {
 	// 思考档位策略缺省：网关按模型最高档补缺档请求，但客户端显式档位优先
 	// （client_priority=true），且不覆盖客户端的关闭思考意图（override_scope=level）。
 	c.Thinking.Enabled = true
-	c.Thinking.DefaultEffort = "max"
+	c.Thinking.DefaultEffort = upstream.DefaultGatewayEffort
 	c.Thinking.ClientPriority = true
 	c.Thinking.OverrideScope = "level"
 	c.Pool.MaxInFlight = 3
@@ -937,6 +961,18 @@ func (c *Config) normalize() error {
 	if c.ShutdownTimeoutDur < 0 {
 		return fmt.Errorf("server.shutdown_timeout: 负时长 %q 无意义", c.Server.ShutdownTimeout)
 	}
+	// 请求体安全上限（OOM 护栏，不是预拦截）：0 = 用默认；越界直接报错——静默钳
+	// 会让护栏悄悄换成另一个数，运维以为配上了其实没配上。
+	if c.Server.MaxPayloadBytes == 0 {
+		c.Server.MaxPayloadBytes = 64 << 20
+	}
+	if c.Server.MaxPayloadBytes < 8<<20 || c.Server.MaxPayloadBytes > 512<<20 {
+		return fmt.Errorf("server.max_payload_bytes: %d 超出允许范围 8–512 MiB", c.Server.MaxPayloadBytes)
+	}
+	// 11140 连坐暂停时长：0 = 关闭（只保留命中即停手），负值无意义。
+	if c.Upstream.RestrictionHoldSeconds < 0 {
+		return fmt.Errorf("upstream.restriction_hold_seconds: 负值 %d 无意义（0 = 关闭）", c.Upstream.RestrictionHoldSeconds)
+	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
 	}
@@ -1197,7 +1233,7 @@ func (c *Config) normalize() error {
 func (c *Config) normalizeThinking() error {
 	c.Thinking.DefaultEffort = strings.ToLower(strings.TrimSpace(c.Thinking.DefaultEffort))
 	if c.Thinking.DefaultEffort == "" {
-		c.Thinking.DefaultEffort = "max"
+		c.Thinking.DefaultEffort = upstream.DefaultGatewayEffort
 	}
 	if c.Thinking.DefaultEffort == "off" || !upstream.IsEffortLevel(c.Thinking.DefaultEffort) {
 		return fmt.Errorf("thinking.default_effort: %q 不是合法档位（max 或 low/medium/high/xhigh 等）", c.Thinking.DefaultEffort)

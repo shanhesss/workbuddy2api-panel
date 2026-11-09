@@ -817,6 +817,10 @@ if ($('navUpdate')) $('navUpdate').onclick = () => {
   $('updateNote').scrollIntoView({ block: 'center', behavior: 'smooth' });
 };
 
+// overviewSig 上一次渲染用的账号+锁池快照（JSON 文本）。轮询每 5 秒一次，内容没变时
+// 跳过表格重渲染：重建 innerHTML 会丢掉行内焦点与悬停，29 个号就是每 5 秒抖一次。
+let overviewSig = '';
+
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
@@ -858,8 +862,13 @@ async function loadOverview(quiet) {
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
-    renderAccounts(d.accounts || []);
-    renderModelLocks(d.model_locks);
+    // 只在载荷真变了才重建两张表（见 overviewSig 注释）。
+    const sig = JSON.stringify([d.accounts || [], d.model_locks || []]);
+    if (sig !== overviewSig) {
+      overviewSig = sig;
+      renderAccounts(d.accounts || []);
+      renderModelLocks(d.model_locks);
+    }
     // 到期提醒随首页统计一起刷新：只用响应里已有的最早到期快照，零上游请求。
     renderExpirySnapshot(d);
   } catch (e) {
@@ -1124,7 +1133,11 @@ async function loadModels(force) {
     // 目录来源：桌面端族是官方 picker 口径；union/enterprise 说明 v3 探测部分或全部失败，
     // 拿到的是回落目录（数量偏少、倍率可能是旧值），必须在界面上说清楚。
     const srcNote = { 'v3-desktop': '', 'v3-union': ' · ⚠ 国际版目录来自回落（IDE+CLI 并集）', 'enterprise': ' · ⚠ 国际版目录已降级到企业端点（窄目录/旧倍率）' }[d.global_source] || '';
-    $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '') + srcNote;
+    // 分域取数失败告警（fetch_errors，2026-10-25）：此前某域失败被后端静默吞掉——
+    // global 探测失败（如 DNS 抖动 → 5min 负缓存）时页面只剩 CN 模型，无从知道原因。
+    const errs = Array.isArray(d.fetch_errors) ? d.fetch_errors.filter(Boolean) : [];
+    const errNote = errs.length ? ' · ⚠ ' + errs.join('；') : '';
+    $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '') + srcNote + errNote;
     renderModels();
     refreshEffortDowngradeNote(); // 模型目录到位后才知道哪些档位会降级
   } catch (e) {
@@ -1223,7 +1236,12 @@ function mdAvailabilityOf(m, locks, recent) {
     return { key: 'limited', label: '限流/不可用', cls: 'warn',
       tip: '模型级冷却中' + (reason ? '；' + reason : '') };
   }
-  const ev = recent.find(e => e && e.model === id);
+  // 同时匹配请求模型与降级后实际模型（model_eff）：请求 A 实际用 B 成功时，
+  // B 的「可用」标注也要由这条真实流量合成（2026-10-25 链路补齐）。
+  // model_eff 记的是出站线协议原值（通常是裸名），而这里的 id 带域前缀，
+  // 两种形态都要认——只比 id 会让 global 域的降级流量完全命中不了。
+  const ev = recent.find(e => e && (e.model === id || e.model === bare ||
+    e.model_eff === id || e.model_eff === bare));
   if (ev) {
     const status = Number(ev.status || 0);
     const when = ev.time ? new Date(ev.time).toLocaleString('zh-CN', { hour12: false }) : '';
@@ -1639,7 +1657,7 @@ function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.model_eff, e && e.account, e && e.request_id]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
@@ -1669,6 +1687,15 @@ function reqCreditCell(e) {
   return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
 }
 
+/* reqModelText 请求记录模型列：请求模型与降级后实际模型是两个不同模型（计价/能力
+   都不同，2026-10-25 实案），显示成 requested->effective；未降级保持单值旧格式。 */
+function reqModelText(e) {
+  const m = e && e.model;
+  const eff = e && e.model_eff;
+  if (!m) return '—';
+  return eff && eff !== m ? m + '->' + eff : m;
+}
+
 /* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
    UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
 function renderRequestTable() {
@@ -1683,7 +1710,7 @@ function renderRequestTable() {
     return '<tr title="' + esc(requestLogText(e)) + '">' +
       '<td class="num">' + esc(when) + '</td>' +
       '<td>' + reqOutcomeTag(e) + '</td>' +
-      '<td>' + esc(e && e.model || '—') + '</td>' +
+      '<td>' + esc(reqModelText(e)) + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -1739,6 +1766,7 @@ function requestLogText(e) {
     when,
     String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
     e && e.model || '—',
+    (e && e.model_eff && e.model_eff !== e.model) ? '⤳ ' + e.model_eff : '',
     e && e.account || '—',
     e && e.client_ip || '—',
     e && e.user_agent || '—',
@@ -1989,7 +2017,10 @@ $('btnCfgReload').onclick = loadConfig;
 // 已有的 accRealmTabs 同构。
 let cfgRealmFilter = 'all';
 function applyCfgRealmFilter() {
+  // tab 按钮自己也带 data-realm（记录它代表哪个域），必须跳过：否则同一段逻辑在
+  // 选「国际版」时会把「全部」「国内版」两个按钮一起隐藏，tab 栏看起来就塌了。
   document.querySelectorAll('#cfgForm [data-realm]').forEach(el => {
+    if (el.closest('#cfgRealmTabs')) return;
     const r = el.getAttribute('data-realm');
     el.style.display = (cfgRealmFilter === 'all' || cfgRealmFilter === r) ? '' : 'none';
   });
@@ -2035,6 +2066,9 @@ $('cfgForm').onsubmit = async ev => {
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
+// 导入预览态的暂存：{files: File[], ready: bool, result?: 预览响应}。
+// 只活到确认导入或关闭弹窗为止；File 对象本身在浏览器里，再次 POST 时重发即可。
+let importPending = null;
 function openAdd() {
   $('addVeil').classList.add('on');
   // 重置到登录标签
@@ -2055,9 +2089,11 @@ function switchAddTab(tab) {
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
   $('addTabApiKey').hidden = tab !== 'apikey';
-  // 页脚按钮随标签切：登录页「获取授权链接」、API Key 页「添加 API Key」，导入页无页脚按钮。
+  // 页脚按钮随标签切：登录页「获取授权链接」、API Key 页「添加 API Key」、
+  // 导入页「确认导入」（仅预览通过后出现，见 renderImportPreview）。
   $('btnAddApiKey').hidden = tab !== 'apikey';
   $('btnStartLogin').hidden = tab !== 'login' || loginState != null;
+  $('btnImportCommit').hidden = !(tab === 'import' && importPending && importPending.ready);
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
@@ -2153,7 +2189,17 @@ async function pollLogin() {
     $('addErr').textContent = '网络中断，自动重试中（' + pollFails + '/' + POLL_MAX_FAILS + '）：' + e.message;
   }
 }
-function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() {
+  stopPoll(); loginState = null; $('addVeil').classList.remove('on');
+  // 导入预览态一并清掉：关掉弹窗再打开时不该还挂着上一次的文件和「确认导入」。
+  importPending = null;
+  $('importPreview').hidden = true;
+  $('importPreview').innerHTML = '';
+  $('btnImportCommit').hidden = true;
+  $('importDone').hidden = true;
+  $('importErr').hidden = true;
+  $('importFile').value = '';
+}
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 
@@ -2185,31 +2231,97 @@ $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
 $('importFile').onchange = async () => {
-  const file = $('importFile').files[0];
-  if (!file) return;
+  const files = Array.from($('importFile').files || []);
   $('importDone').hidden = true; $('importErr').hidden = true;
-  const fd = new FormData();
-  fd.append('file', file);
-  const h = {};
-  const k = localStorage.getItem(LS_KEY);
-  if (k) h['Authorization'] = 'Bearer ' + k;
+  importPending = null;
+  $('importPreview').hidden = true;
+  $('btnImportCommit').hidden = true;
+  if (!files.length) return;
+  // 导入是不可逆动作（覆盖已有凭据前还要过上游校验），所以分两步：选中文件后先
+  // 发一次 dryRun 预览——服务端只做解析、必填、uid 合法性与批内去重，不落盘、
+  // 不发上游请求；点「确认导入」才真正写入。
+  //
+  // 多文件在服务端是整体事务：任一文件不是合法 JSON 或没有任何账号就整体 400，
+  // 不做「先把前面那部分导进去」。顺序即选择顺序（先选的优先）。
+  importPending = { files, ready: false };
+  const label = files.length > 1 ? files.length + ' 个文件' : files[0].name;
+  $('importPreview').hidden = false;
+  $('importPreview').innerHTML = '<div class="hint">正在校验 ' + esc(label) + '…</div>';
   try {
-    const r = await fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h });
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    const d = await postImport(true);
+    importPending.result = d;
+    importPending.ready = true;
+    renderImportPreview(label, d);
+    $('btnImportCommit').hidden = false;
+  } catch (e) {
+    importPending = null;
+    $('importPreview').innerHTML = '<div class="hint" style="color:var(--warn)">校验失败，未导入任何账号：' + esc(e.message) + '</div>';
+    $('btnImportCommit').hidden = true;
+  }
+};
+$('btnImportCommit').onclick = async () => {
+  if (!importPending || !importPending.ready) return;
+  const btn = $('btnImportCommit');
+  btn.disabled = true;
+  const label = importPending.files.length > 1 ? importPending.files.length + ' 个文件' : importPending.files[0].name;
+  try {
+    const d = await postImport(false);
+    $('importPreview').hidden = true;
     $('importDone').hidden = false;
-    $('importDone').textContent = '导入完成：成功 ' + d.imported + ' 个' + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
-    if (d.errors && d.errors.length) {
-      console.warn('import errors:', d.errors);
-    }
+    $('importDone').textContent = '导入完成（' + label + '）：新增 ' + (d.creates || 0)
+      + ' 个，覆盖 ' + (d.overwrites || 0) + ' 个'
+      + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
+    if (d.errors && d.errors.length) console.warn('import errors:', d.errors);
+    importPending = null;
+    $('btnImportCommit').hidden = true;
     invalidatePackages();
     loadOverview(true);
   } catch (e) {
     $('importErr').hidden = false;
     $('importErr').textContent = '导入失败：' + e.message;
+    btn.disabled = false;
   }
   $('importFile').value = '';
 };
+
+// 预览区：先给一句人话结论（新增/覆盖/跳过），再列具体条目问题。
+// 跳过项只列前 20 条——几百条的清单塞进弹窗只会把「结论」顶出视野。
+function renderImportPreview(label, d) {
+  const bits = ['新增 ' + (d.creates || 0) + ' 个', '覆盖 ' + (d.overwrites || 0) + ' 个'];
+  if (d.skipped) bits.push('跳过 ' + d.skipped + ' 个');
+  let html = '<div class="hint"><b>' + esc(label) + '</b> · 共 ' + (d.total || 0) + ' 条：' + bits.join('，') + '</div>';
+  if (d.overwrites) {
+    html += '<div class="hint" style="font-size:12px">覆盖项会先用 refresh 向上游求证新凭据可用，通过才写盘；不通过则保留原有凭据。</div>';
+  }
+  const errs = d.errors || [];
+  if (errs.length) {
+    const shown = errs.slice(0, 20);
+    html += '<div class="hint" style="font-size:12px;margin-top:4px;color:var(--ink-3)">跳过明细'
+      + (errs.length > shown.length ? '（前 ' + shown.length + ' 条，共 ' + errs.length + ' 条）' : '')
+      + '：</div><div style="max-height:120px;overflow:auto;font-size:12px;color:var(--ink-2)">'
+      + shown.map(e => '<div>' + esc(e) + '</div>').join('') + '</div>';
+  }
+  if (!d.imported) {
+    html += '<div class="hint" style="color:var(--warn)">没有可导入的账号。</div>';
+  }
+  $('importPreview').innerHTML = html;
+}
+
+// 导入请求：多文件按选择顺序塞进同一个 multipart，服务端逐份解码后合并。
+function postImport(dryRun) {
+  const fd = new FormData();
+  for (const f of importPending.files) fd.append('file', f, f.name);
+  if (dryRun) fd.append('dryRun', 'true');
+  const h = {};
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  return fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h })
+    .then(async r => {
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      return d;
+    });
+}
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
@@ -3873,20 +3985,31 @@ function renderExpirySnapshot(d) {
     return ax < ay ? -1 : ax > ay ? 1 : 0;
   });
   const EXP_HEAD = 3;  // 默认只展开最近到期的 3 个账号，其余收纳成一行
+  /* 「最近到期」这一格分两层（用户反馈：旧版日期 / 随后 N 批 / 7 天内合计 三行
+     同字号同颜色，主次分不出来）：
+       第一行 = 日期（加大加粗）+「（明天到期）」+「7 天内合计 N」，
+       第二行 = 后续批次索引，只给日期与剩余量，弱化到 --ink-3 / 12px。
+     该批积分与日均需耗本来就有独立列，这里不再重复一遍；紧急性依旧只由
+     「距到期」列着色，不额外加色点。 */
   const rowOf = ({ a, bs }, hidden) => {
     const first = bs[0];
     const days = expDayDiff(first.date);
     const daily = Math.ceil(first.remain / Math.max(1, days));
     const week = bs.filter(b => expDayDiff(b.date) <= 7).reduce((s, b) => s + b.remain, 0);
     const color = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
-    const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
-    const rest = bs.slice(1, 4).map(b =>
-      '随后 ' + esc(b.date.slice(5)) + ' · ' + fmtTok(b.remain)).join('　') + more;
-    const sub = (rest ? '<div class="note">' + rest + '</div>' : '') +
-      (week > first.remain ? '<div class="note">7 天内合计 ' + fmtTok(week) + '</div>' : '');
+    const when = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
+    const head = '<div class="exp-first">' +
+      '<span class="exp-date">' + esc(first.date) + '</span>' +
+      '<span class="exp-days">（' + when + '）</span>' +
+      (week > first.remain ? '<span class="exp-week">7 天内合计 <b>' + fmtTok(week) + '</b></span>' : '') +
+      '</div>';
+    const rest = bs.slice(1, 4).map(b => '<span>随后 ' + esc(b.date.slice(5)) + ' · ' +
+      fmtTok(b.remain) + '</span>').join('');
+    const more = bs.length > 4 ? '<span>等 ' + bs.length + ' 批</span>' : '';
     return '<tr' + (hidden ? ' data-exp-row="rest" hidden' : '') + '>' +
       '<td>' + esc(a.nickname || String(a.uid || '').slice(0, 8)) + '</td>' +
-      '<td>' + esc(first.date) + sub + '</td>' +
+      '<td>' + head +
+        (rest ? '<div class="exp-batches">' + rest + more + '</div>' : '') + '</td>' +
       '<td class="num" style="color:' + color + '">' +
         (days === 0 ? '今天' : days === 1 ? '明天' : days + ' 天') + '</td>' +
       '<td class="num">' + fmtTok(first.remain) + '</td>' +
@@ -4979,6 +5102,10 @@ async function loadBalance() {
     if (host) host.innerHTML = '<div class="us-empty">读取余额趋势失败：' + esc(e.message) + '</div>';
   }
 }
+/* 窗口选择与「刷新」自己没有事件：切换视图才会重跑 loadBalance，
+   改了窗口或点刷新都没反应，控件形同摆设（issue #186）。 */
+if ($('bhWindow')) $('bhWindow').onchange = loadBalance;
+if ($('btnBalHist')) $('btnBalHist').onclick = loadBalance;
 
 /* ── 图表与域标签工具（迁移遗漏，20261021 补齐）── */
 const CHART_FALLBACK_W = 760;
@@ -5374,6 +5501,10 @@ if ($('btnEventClearFilters')) $('btnEventClearFilters').onclick = () => {
   if ($('eventFilterModel')) $('eventFilterModel').value = '';
   if ($('eventFilterAccount')) $('eventFilterAccount').value = '';
   if ($('eventFilterStatus')) $('eventFilterStatus').value = '';
+  // 记住的状态也是「筛选条件」的一部分（issue #160 引入的偏好）：只清下拉不清偏好，
+  // 下次打开页面 / reload 时会把「错误」重新选回去，用户以为清除筛选没生效。
+  // 模型 / 来源两项本来就不落盘（每次按归档重建选项），无需处理。
+  prefSet('eventStatus', '');
   renderEventTable();
 };
 if ($('btnEventRefresh')) $('btnEventRefresh').onclick = loadEvents;

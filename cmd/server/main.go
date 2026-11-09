@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof" // WB2API_PPROF 打开时提供 /debug/pprof（默认无监听）
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -378,13 +379,14 @@ func main() {
 	// 模型白名单（issue #68）：启动时归一化一次，快照只读持有。
 	allowedModels, allowlistEnabled := livecfg.NormalizeAllowedModels(cfg.Models.Allowed)
 	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-		EmbeddingsEnabled:    cfg.Features.EmbeddingsEnabled,
-		RecordClientInfo:     cfg.Logging.RequestClientInfo,
-		RecordContext:        cfg.Logging.RequestArchiveContext,
-		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		APIKey:                cfg.APIKey,
+		SoftCooldown:          cfg.SoftRateDur,
+		SanitizeFingerprints:  cfg.Features.SanitizeBlacklistFingerprints,
+		EmbeddingsEnabled:     cfg.Features.EmbeddingsEnabled,
+		WatermarkStripEnabled: cfg.Features.WatermarkStripEnabled,
+		RecordClientInfo:      cfg.Logging.RequestClientInfo,
+		RecordContext:         cfg.Logging.RequestArchiveContext,
+		HiddenModels:          livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 		// 模型白名单（issue #68）：归一化集合 + 启用标志；空配置 = 不启用。
 		AllowedModels:    allowedModels,
 		AllowlistEnabled: allowlistEnabled,
@@ -508,6 +510,8 @@ func main() {
 		auditLog = al
 		log.Printf("admin audit: %s", al.Path())
 	}
+	// MCP serverInfo.version 与面板 /status 用同一个版本串（本地构建是 dev）。
+	server.BuildVersion = appVersion
 	gw = server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -544,6 +548,9 @@ func main() {
 		BudgetLimit:      cfg.Budget.DailyCreditLimit,
 		BurstCreditLimit: cfg.Budget.BurstCreditLimit,
 		CacheLowRate:     cfg.Budget.CacheLowRate,
+		// 入站请求体 OOM 护栏 + 11140 连坐暂停（两处都只在启动时读，改完需重启）。
+		MaxPayloadBytes: cfg.Server.MaxPayloadBytes,
+		RestrictionHold: time.Duration(cfg.Upstream.RestrictionHoldSeconds) * time.Second,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -607,6 +614,18 @@ func main() {
 	// 模型归零；倍率表当时尚未建立）。
 	// 异步执行：不阻塞监听启动；失败仅记日志（下一轮懒触发或本轮重试仍可补上）。
 	go warmModelRates(ctx, up, p)
+
+	// 诊断用：WB2API_PPROF=127.0.0.1:6060 时另起一个只跑 pprof 的监听。
+	// 默认不开启（不设环境变量就完全没有这个监听），供「并发一高就降速」这类
+	// 只能靠真实负载定位的 CPU 问题取 profile（取完即关容器，不常驻生产）。
+	if addr := os.Getenv("WB2API_PPROF"); addr != "" {
+		go func() {
+			log.Printf("[pprof] 诊断监听开启 %s（CPU: /debug/pprof/profile?seconds=30）", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				log.Printf("WARN: [pprof] 监听失败 %v", err)
+			}
+		}()
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -855,13 +874,14 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 白名单同步重建（issue #68）：面板保存 models.allowed 后即时生效。
 	newAllowedModels, newAllowlistEnabled := livecfg.NormalizeAllowedModels(newCfg.Models.Allowed)
 	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-		EmbeddingsEnabled:    newCfg.Features.EmbeddingsEnabled,
-		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
-		RecordContext:        newCfg.Logging.RequestArchiveContext,
-		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+		APIKey:                newCfg.APIKey,
+		SoftCooldown:          newCfg.SoftRateDur,
+		SanitizeFingerprints:  newCfg.Features.SanitizeBlacklistFingerprints,
+		EmbeddingsEnabled:     newCfg.Features.EmbeddingsEnabled,
+		WatermarkStripEnabled: newCfg.Features.WatermarkStripEnabled,
+		RecordClientInfo:      newCfg.Logging.RequestClientInfo,
+		RecordContext:         newCfg.Logging.RequestArchiveContext,
+		HiddenModels:          livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 		// 白名单热生效：与 HiddenModels 同一条快照重建通路（issue #68）。
 		AllowedModels:    newAllowedModels,
 		AllowlistEnabled: newAllowlistEnabled,

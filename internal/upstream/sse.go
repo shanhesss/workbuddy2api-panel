@@ -3,6 +3,7 @@ package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -580,6 +581,16 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	markup    *MarkupRepair
 	echoModel string
+	// clientGone 客户端是否已经断开（handler 传 r.Context().Err()!=nil）。
+	// 只用于「日志归因」：客户端自己走了，上游只是被动跟随，那条「上游未给终态」
+	// 的 WARN 就不该记（线上实测过一次 pkill 客户端就刷出一条 WARN，进「错误汇总」
+	// 的未归类桶，把真正的上游断流盖掉）。
+	clientGone func() bool
+}
+
+// WithClientGoneFn 注入「客户端是否已断开」的判定（可为 nil）。
+func WithClientGoneFn(fn func() bool) StreamOption {
+	return func(o *streamOptions) { o.clientGone = fn }
 }
 
 // WithModelEcho 强制所有出站帧的顶层 model 字段为 name（issue #30：模型映射）。
@@ -622,6 +633,30 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
+	// br 在下面才初始化，但写帧闭包要用它判断「上游缓冲是否已读空」→ 先声明。
+	var br *bufio.Reader
+	// flushIfDrained 只在**下一帧不在本地缓冲里**时才 flush。
+	//
+	// 上游把一条长回答按 token 切成上万帧、成批到达：每帧都 flush 就是每帧一次
+	// write 系统调用，线上 profile 里 Flush+syscall 占流式 CPU 的近一半（14470 帧/
+	// 请求的实测形态）。本地缓冲里还有完整帧时立刻就会继续写，这次 flush 纯属浪费；
+	// 只有缓冲读空（下一次读会阻塞在 socket 上）才必须把已写内容推给客户端。
+	// 缓冲里只剩半行（没有换行符）也一样会阻塞，同样要 flush——否则上游若在此停顿，
+	// 客户端会一直等一个已经生成好的帧。
+	flushIfDrained := func() {
+		if fl == nil || br == nil {
+			return
+		}
+		switch n := br.Buffered(); {
+		case n == 0:
+			fl.Flush()
+		case n < 8192:
+			// 帧很小（~200B），缓冲还有 8KB 以上时必然含完整帧，不必扫。
+			if p, _ := br.Peek(n); bytes.IndexByte(p, '\n') < 0 {
+				fl.Flush()
+			}
+		}
+	}
 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
@@ -650,9 +685,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
 			return werr
 		}
-		if fl != nil {
-			fl.Flush()
-		}
+		flushIfDrained()
 		return nil
 	}
 
@@ -786,9 +819,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
 			return werr
 		}
-		if fl != nil {
-			fl.Flush()
-		}
+		flushIfDrained()
 		return nil
 	}
 
@@ -829,12 +860,16 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		return 1, nil
 	}
 
-	br := bufio.NewReaderSize(r, 64*1024)
+	br = bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
 	// headOpen 首帧否决窗口：尚未向客户端写出任何字节。窗口内遇到上游 error 帧
 	// （或整个流零有效帧）就返回 HeadVetoError 而不写字节——上层据此换号重试，
 	// 客户端看不到这次失败（见 HeadVetoError）。
 	headOpen := true
+	// upstreamDone 上游是否显式发过 data: [DONE]。与 finishSeen（本层是否已向客户端
+	// 写出过 finish_reason）合起来判「这段流是不是被截断」：两者都没有 = 上游连接在
+	// 说一半时断了，既没有正常收尾也没给终态。
+	upstreamDone := false
 readLoop:
 	for {
 		line, err := br.ReadString('\n')
@@ -843,6 +878,7 @@ readLoop:
 		case strings.HasPrefix(trimmed, "data: [DONE]"):
 			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
 			// [DONE] 统一在循环结束后写出，保证恰好一个。
+			upstreamDone = true
 			break readLoop
 		case strings.HasPrefix(trimmed, "data: "):
 			payload := strings.TrimPrefix(trimmed, "data: ")
@@ -886,9 +922,7 @@ readLoop:
 			if _, werr := io.WriteString(w, "\n"); werr != nil {
 				return werr
 			}
-			if fl != nil {
-				fl.Flush()
-			}
+			flushIfDrained()
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
 		if err != nil {
@@ -923,6 +957,25 @@ readLoop:
 				return werr
 			}
 		}
+	}
+	// 截断兜底：上游既没给 finish_reason，也没发 data: [DONE] 就 EOF —— 这是上游连接
+	// 说到一半断了，不是正常收尾。此前这种流只会补一个 [DONE]：chat 客户端看到「内容 +
+	// 结束」但 finish_reason 为空，responses 适配器更直接回 response.completed，Agent 侧
+	// 表现就是「说到一半停了、也不报错」，只能人工接着催。这里补一帧截断终态：chat 侧看到
+	// finish_reason=length（TruncationFinishReason），responses 侧映射成
+	// incomplete(max_output_tokens)，由客户端自己决定续写/重试——网关不再把断流伪装成成功。
+	// 只在本层一个终态都没发过时补（否则两个 finish_reason，后一个会洗掉前一个）。
+	if !upstreamDone && !finishSeen && !toolFinishSent && validFrames > 0 {
+		// 客户端自己断开时上游只是被动跟随断连，这条不是上游故障——记 WARN 会把
+		// 真正的中断盖掉（错误汇总按类别聚合，噪音会挤掉信噪比）。归因交给 handler
+		// 的 interrupted 观测（499），这里只在客户端还在等时才告警。
+		if o.clientGone == nil || !o.clientGone() {
+			log.Printf("WARN: [server] stream 上游未给终态就结束（无 finish_reason、无 data: [DONE]，%d 个有效帧）→ 按截断收尾", validFrames)
+		}
+		if werr := writeChunk(finishOnlyFrame(map[string]any{}, TruncationFinishReason), ""); werr != nil {
+			return werr
+		}
+		finishSeen = true
 	}
 	// 空流（0 有效帧）：尚未写出任何字节时先走首帧否决（上层换号比补一帧假成功的
 	// error 更有价值）；已经写过注释/心跳行（响应头已提交）则只能照旧兜底——先写一帧
