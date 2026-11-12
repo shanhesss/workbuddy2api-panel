@@ -100,6 +100,10 @@ type Config struct {
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
 
+	// HeadKeepalive 等上游首帧期间的 SSE 注释帧间隔（server.head_keepalive）。
+	// 0 = 关闭（回到「首帧否决窗口内零字节」的旧行为）。见 headkeepalive.go。
+	HeadKeepalive time.Duration
+
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
@@ -564,6 +568,18 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	}
 	if mi.IsDefault {
 		entry["is_default"] = true
+	}
+	// 限时优惠（上游 modelPromotions）：credits 是**牌价**，promo_* 是当前生效折扣。
+	// 这两个字段原先只在 /panel/api/models 里透出，OpenAI 兼容端点看不到——而第三方
+	// 启动器/客户端恰恰只读 /v1/models 来判断「这个模型现在是不是免费」（issue #203）。
+	// 口径与面板一致：PromoFactor 为 nil 表示上游没给可计算的折扣（例如「错峰使用」
+	// 只有标签没有系数），此时不写 promo_factor，但仍写标签。
+	if mi.PromoFactor != nil {
+		entry["promo_factor"] = *mi.PromoFactor
+		entry["promo_credits"] = mi.PromoCredits
+	}
+	if mi.PromoLabel != "" {
+		entry["promo_label"] = mi.PromoLabel
 	}
 	if mi.SupportsImages {
 		entry["supports_images"] = true // 多模态能力透出
@@ -1047,6 +1063,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// routeModel：映射请求显示真实路由名（别名 INFO 行已记录 客户端名 -> 真实名，
 	// 两行合看即全链路；流水行与账本/上游口径一致，运维排查不用做心算翻译）。
 	st := newChatStat(time.Now(), routeModel, peek.Stream, h.budget)
+	// 等上游首帧期间向客户端补 SSE 注释帧（见 headkeepalive.go）：大上下文 TTFB
+	// 可达 3~6 秒，而 StreamHint 首帧否决窗口内一个字节都不写，客户端会把它当
+	// 「连接僵死」自行放弃（线上实测四次零内容中断全落在 3.46~4.09s）。
+	// 放在轮转循环之前：选号/建请求这段空窗也一起覆盖；写过注释后响应头已提交，
+	// 后续错误由 writeOpenAIError* 的「已提交」分支降级成协议内 error 帧。
+	if h.cfg.HeadKeepalive > 0 && peek.Stream {
+		hk := newHeadKeepaliveWriter(r.Context(), w, h.cfg.HeadKeepalive)
+		if hk != nil {
+			w = hk
+			defer hk.stop()
+		}
+	}
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -1178,6 +1206,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if stickyUID != "" && uid == stickyUID {
 			unbindSticky()
 		}
+	}
+	// failKeepBinding 供**请求级错误**（内容拦截 / prompt 超长 / 图片无效 / 参数错）使用：
+	// 只释放租约，**不解绑会话**。
+	//
+	// 这些错误与账号无关（同一个 body 换任何号都会撞），账号仍然健康、它的前缀缓存也
+	// 还热着；一旦解绑，下一轮就会被分配到另一个号上，十万~几十万 token 的前缀从头
+	// 重算——用户看到的就是「报错一次之后缓存就一直不生效」，而且报错越密集（例如
+	// 上游 content_blocked 成片出现时）越会连环换号，每一跳都是全量 miss。
+	failKeepBinding := func(uid string) {
+		releaseHeld()
 	}
 	// ttfb 首 token 等待（仅流式有观测；非流式传 0 = 无观测，速率不扣减）。
 	// 显式入参而不是读 st.ttfb：后者在流式分支里是**调用之后**才赋值的，
@@ -1490,10 +1528,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				fail(acct.UID)
 				break
 			}
-			h.cfg.Pool.NoteFailures(acct.UID)
+			// 出口级归因（egress.go）：走到这里的传输层失败**只可能**是直连路径
+			// （经代理的失败是 proxypool.Error，上面已终止轮转），而直连出口由本域
+			// 全部账号共用。拨号/TLS 失败发生在上游看到这个号之前，不携带「这个号
+			// 坏了」的任何证据；记到账号头上时，一次链路抖动会顺着轮转逐个给被选中
+			// 的号记连败——hub 现场实测 4 小时 196 次 URLError 陆续降权 13 个号，
+			// 而链路只断了几秒。改记出口，退避降到秒级。
+			streak := h.cfg.Pool.NoteEgressFailure(egressKey(acct), time.Now())
 			fail(acct.UID)
-			if !rotateBackoff(i, r.Context()) {
-				break // ctx 取消：终止轮转（传输层错误换号退避）
+			if streak >= egressGiveUpStreak {
+				// 链路连续失败：换号只是把同样的等待与失败重复一遍（换不到别的
+				// 链路），快速失败让客户端按自己的节奏重试。
+				break
+			}
+			if !sleepCtx(r.Context(), egressBackoff(streak, egressBackoffBase)) {
+				break // ctx 取消：终止轮转（传输层错误换路退避）
 			}
 			continue
 		}
@@ -1582,7 +1631,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// error-passthrough：message 装上游 body 原文（code/msg/requestId 原样），
 				// 不再改写成网关固定文案——客户端必须看到真实错误才能排查。
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				failKeepBinding(acct.UID)
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
@@ -1602,7 +1651,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
 			if kind == upstream.ErrPromptTooLong {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				failKeepBinding(acct.UID)
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
@@ -1613,7 +1662,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 同一 body 换账号仍是同样的解析结果，轮转只会放大无效请求。
 			if kind == upstream.ErrImageInvalid {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				failKeepBinding(acct.UID)
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = "image request was rejected by upstream"
@@ -1671,7 +1720,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 补自愈时在 fail() 前重写 body 再走一次同账号尝试即可。
 			if kind == upstream.ErrToolMismatch {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				// 同样是请求级错误（工具调用与结果配不上，换任何号都一样）：只释放租约，
+				// 不解绑会话，避免客户端重试时被丢到一个缓存全冷的号上。
+				failKeepBinding(acct.UID)
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = "upstream rejected the request: tool calls and tool results do not match"
@@ -2370,6 +2421,20 @@ func rotateBackoff(i int, ctx context.Context) bool {
 	return true
 }
 
+// egressKey 这次传输层失败该记到哪个出口上。
+//
+// 键 = "direct:" + 域：cn 与 global 是不同的上游域名与网络环境，共用一条阶梯会让
+// 一个域的抖动压住另一个域刚恢复的那几秒。经代理的失败走不到这里（proxypool.Error
+// 在上游分支已终止轮转），所以不需要节点身份；真要按节点分级，应取
+// proxypool.Error.ProxyID，而不是在账号上猜。
+func egressKey(a *auth.Auth) string {
+	realm := "cn"
+	if a != nil && a.Realm() != "" {
+		realm = a.Realm()
+	}
+	return "direct:" + realm
+}
+
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
 // kind 是唯一权威分类（来自 upstream.Classify / ChatStreamContext 的 *Error 信封），
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
@@ -2431,6 +2496,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			modelReason = s
 		}
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
+			// 额度窗口登记（pool/window.go）：上游按**首次请求**起算新一轮配额窗口，
+			// 到点没有请求进来窗口就不开始——额度一直空转，下一条真实请求来的时候
+			// 起点才被动落到那一刻。冷却只做到「允许请求进来」，不做「让窗口开始」。
+			// 登记后由 scheduler 的窗口探针在重置时刻发一个最小请求把起点钉住。
+			//
+			// 只在 model != "" 时登记：没有模型名（账号级 429）时窗口键无从构造，而
+			// 账号级冷却的语义本来就与配额窗口无关。
+			if modelRateLimited && model != "" {
+				h.cfg.Pool.ScheduleModelWindow(uid, model, resetAt, !upstream.IsModelBusy(body), time.Now())
+			}
 			if modelRateLimited {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, modelReason)
 				return
@@ -2633,6 +2708,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
+	if k, ok := w.(*headKeepaliveWriter); ok && k.Committed() {
+		k.writeErrorFrame(status, "api_error", code, msg, "")
+		return
+	}
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,
@@ -2653,6 +2732,10 @@ const wafCooldownBase = 60 * time.Second
 // error.gateway_hint（hint 为空串时不带字段——未覆盖形态不编造）。
 // message 仍是上游原文透传（hint 只做并列补充，绝不替换/包装 message）。
 func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint string) {
+	if k, ok := w.(*headKeepaliveWriter); ok && k.Committed() {
+		k.writeErrorFrame(status, "api_error", code, msg, hint)
+		return
+	}
 	if hint == "" {
 		writeOpenAIError(w, status, code, msg)
 		return
@@ -2671,6 +2754,10 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 // （OpenAI 自身 quota 错误的字段口径，客户端按 type 或 code 任一即可识别「不是限流、
 // 重试无意义」）。message 照旧装上游原文或自有文案。
 func writeOpenAIQuotaError(w http.ResponseWriter, msg, hint string) {
+	if k, ok := w.(*headKeepaliveWriter); ok && k.Committed() {
+		k.writeErrorFrame(http.StatusTooManyRequests, "insufficient_quota", "insufficient_quota", msg, hint)
+		return
+	}
 	e := map[string]any{
 		"message": msg,
 		"type":    "insufficient_quota",
@@ -2688,6 +2775,10 @@ func writeOpenAIQuotaError(w http.ResponseWriter, msg, hint string) {
 // 写成 "insufficient_quota" 字符串会让它既认不出配额也认不出业务码。
 // type 仍标 insufficient_quota：OpenAI 口径里这就是「别重试，去等额度」。
 func writeModelQuotaError(w http.ResponseWriter, code int, msg, hint string) {
+	if k, ok := w.(*headKeepaliveWriter); ok && k.Committed() {
+		k.writeErrorFrame(http.StatusTooManyRequests, "insufficient_quota", strconv.Itoa(code), msg, hint)
+		return
+	}
 	e := map[string]any{
 		"message": msg,
 		"type":    "insufficient_quota",

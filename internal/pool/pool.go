@@ -38,6 +38,13 @@ type Pool struct {
 	exploreLast map[string]time.Time
 	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
 	costExploreEvents int64
+	// egress 出口级瞬时失败计数（egress.go，键 = 出口身份）。运行态，不持久化：
+	// 链路状态易失，重启后从零开始是正确的。
+	egress map[string]egressStat
+	// windows 额度窗口登记表（window.go）：429 带重置时刻时登记，到点主动发探针
+	// 让新一轮窗口从重置那一刻起算。**持久化**——进程内冷却表是易失的，窗口记录
+	// 跟着丢就等于每次重启都错过重置时刻，正是本机制要治的那段空转。
+	windows map[string]*ModelWindow
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int
@@ -111,6 +118,14 @@ type Pool struct {
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+
+	// strategy 选号策略（weighted / round_robin / sequential，见 strategy.go）。
+	// 空 = weighted（既有行为）。它只决定「同样合格的候选里选哪个」——健康、冷却、
+	// 在途、积分保底、成本分层、账号优先级全部先于它生效，策略无法绕过它们。
+	strategy string
+	// scheduling 策略游标：(realm, 模型) → 上次用到的账号。运行态不持久化
+	// （重启从环头重来，只影响下一次的起点，不影响正确性）。
+	scheduling map[string]scheduleCursor
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -132,6 +147,8 @@ func New(stateFp string) *Pool {
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
+		strategy:            StrategyWeighted,
+		scheduling:          map[string]scheduleCursor{},
 	}
 	if stateFp != "" {
 		p.load()
@@ -460,6 +477,25 @@ func (p *Pool) Add(a *auth.Auth) {
 	p.upsertLocked(a)
 }
 
+// AuthFor 返回账号凭证指针（只读用途：发起内部请求，如额度窗口探针）。
+//
+// 为什么需要它：池对外只给 Status（纯展示数据），而「用某个具体账号发一个最小请求」
+// 需要 *auth.Auth 本体。返回指针而非拷贝是刻意的——refresh 会就地改写 token，拷贝
+// 会让调用方拿着过期凭证打上游。
+//
+// 调用方**不得**修改返回值的可导出字段（除 auth 自带的加锁方法外）；uid 不存在返回 nil。
+func (p *Pool) AuthFor(uid string) *auth.Auth {
+	if uid == "" {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.a
+	}
+	return nil
+}
+
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
@@ -480,6 +516,45 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	if changed && !p.saveLocked() {
 		p.dirty.Store(true) // 剔除结果没落盘：交给 flusher 重试，否则已删账号下次启动复活
 	}
+}
+
+// InFlight 返回某账号当前在途请求数（不存在/已删除返回 0）。
+//
+// 热重载剔除账号前用它做一次「真的没人用」检查：把在途请求的账号从池里拿掉，
+// 那条请求收尾时 Release 会对已删条目变成 no-op，计费/日志都还算得上，但面板上
+// 会出现「账号消失时还有流量」。宁可下一轮扫描再删。
+func (p *Pool) InFlight(uid string) int64 {
+	p.mu.RLock()
+	e, ok := p.byUID[uid]
+	p.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return e.inFlight.Load()
+}
+
+// RemoveMany 批量剔除账号并只落盘一次；返回实际剔除的 uid。热重载用。
+//
+// 与逐个 Remove 的差别：一次 saveLocked，避免 N 个账号批量消失时写 N 次 state.json。
+// 不在池里的 uid 静默忽略（并发下另一个调用可能已经删过）。
+func (p *Pool) RemoveMany(uids []string) []string {
+	if len(uids) == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var removed []string
+	for _, uid := range uids {
+		if _, ok := p.byUID[uid]; !ok {
+			continue
+		}
+		delete(p.byUID, uid)
+		removed = append(removed, uid)
+	}
+	if len(removed) > 0 && !p.saveLocked() {
+		p.dirty.Store(true)
+	}
+	return removed
 }
 
 // Remove 从池中移除账号并立即落盘（管理面板用）。返回被移除账号的凭证

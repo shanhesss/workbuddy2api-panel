@@ -114,6 +114,21 @@ type continueReader struct {
 	// narrationTried 预告式收尾的救援续写已用（每请求一次；见 tryNarrationRetry）。
 	narrationTried bool
 
+	// toolOnlyTried 安全续写（只采纳工具调用）已用（每请求一次；见 tryToolOnlyRescue）。
+	toolOnlyTried bool
+	// toolOnly 当前段处于「只采纳工具调用」模式：正文/思考增量全部丢弃。
+	toolOnly bool
+	// toolCallBuf 只在 toolOnly 段暂存工具调用帧：判为「重发上一次调用」时整段丢弃，
+	// 否则 settleToolOnly 里按原顺序补发（见那里的说明）。
+	toolCallBuf []string
+	// toolCallNames/toolCallArgs 按 index 累积续写段的工具调用（name 与 arguments 都
+	// 分片到达），用于与请求体历史里上一次执行的调用做同名同参比较。
+	toolCallNames map[int]string
+	toolCallArgs  map[int]string
+	// origFinish/origTail 首段的终态帧：续写段没给工具调用时原样回放。
+	origFinish string
+	origTail   []string
+
 	lastClientAt time.Time // 上次客户端可见输出/keepalive 的时刻（静默节流）
 
 	// readErr 本段结束时的读错误（nil = 上游 [DONE] 正常收尾）。用于区分「上游
@@ -276,9 +291,13 @@ func (r *continueReader) frame(payload string) {
 	}
 	deltaNonEmpty := false
 	rebuilt := false
+	bufferedToolFrame := false // 本帧只含工具调用且处于 toolOnly 段：入缓存不下发
 	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
 		if c, ok := chs[0].(map[string]any); ok {
 			if d, ok := c["delta"].(map[string]any); ok {
+				if r.toolOnly && !r.toolSeen && discardToolOnlyDelta(d) {
+					rebuilt = true
+				}
 				if s, ok := d["reasoning_content"].(string); ok && s != "" {
 					r.reason.WriteString(s)
 					// 续写段思考的接缝策略（两个子情形）：
@@ -304,6 +323,12 @@ func (r *continueReader) frame(payload string) {
 				if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
 					r.toolSeen = true
 					deltaNonEmpty = true
+					// 「只采纳工具调用」段：先攒着不下发——settleToolOnly 要拿它跟历史上
+					// 上一次执行过的调用比对，判为重发就整段丢弃（见那里的说明）。
+					if r.toolOnly {
+						r.captureToolCallDeltas(tcs)
+						bufferedToolFrame = true
+					}
 				}
 			}
 			if fr, ok := c["finish_reason"].(string); ok && fr != "" {
@@ -334,6 +359,10 @@ func (r *continueReader) frame(payload string) {
 	}
 	if hasUsage && !deltaNonEmpty {
 		return // 纯 usage 帧（已入账）：不再下发
+	}
+	if bufferedToolFrame {
+		r.toolCallBuf = append(r.toolCallBuf, payload)
+		return
 	}
 	r.emit(payload)
 }
@@ -432,7 +461,13 @@ func (r *continueReader) endSegment(sawDone bool) {
 	if r.cur != nil {
 		r.cur.Close()
 	}
+	// 安全续写段的裁决：拿到工具调用就采纳（继续正常收尾），否则回滚到首段终态。
+	r.settleToolOnly()
 	if r.tryStarvedRetry() {
+		return
+	}
+	// 安全续写（只采纳工具调用）：模型刚看完工具结果却只写一句就收尾。
+	if r.tryToolOnlyRescue() {
 		return
 	}
 	// 预告式收尾（finish=stop + 正文停在「……：」上 + 工具类请求）：续写剩余内容。
@@ -516,6 +551,13 @@ func (r *continueReader) endSegment(sawDone bool) {
 	if r.usage != nil {
 		raw, _ := json.Marshal(map[string]any{"id": r.id, "object": "chat.completion.chunk", "choices": []any{}, "usage": r.usage})
 		r.emit(string(raw))
+	}
+	// 救援效果的可观测性：本次命中的是「预告句收尾」时，记录续写后到底拿到了什么。
+	// 没有这行就分不清「救回来是工具调用（回合继续）」和「只是多打了一段正文」——
+	// 线上实测命中率能到请求量的三成，必须能算清楚收益再决定判据要不要收。
+	if r.narrationTried {
+		log.Printf("[narration] acct=%s model=%s 结果：共 %d 段，工具调用=%v，正文合计=%dB",
+			logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg+1, r.toolSeen, r.text.Len())
 	}
 	r.done = true
 }

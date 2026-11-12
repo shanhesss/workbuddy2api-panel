@@ -660,7 +660,7 @@ function renderAccounts(list) {
         // 「探活」单独占一槽（仅封禁态渲染）：它与「解冻」是两个独立动作，若挤在同一
         // 槽里输出两个按钮，冻结行的列数就与其它行不同，整列又会错位。
         (personal ?
-          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' : ''),
+          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到：重复签发不了积分，点击只是重查状态并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' : ''),
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>',
         (personal ?
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' : ''),
@@ -760,6 +760,74 @@ function renderUpdateStatus(update) {
   $('btnUpdateInstall').disabled = updateBusy || !!update.installing;
   $('btnUpdateRelease').hidden = (!update.update_available && !unknown) || !!update.can_install || !update.release_url;
   $('btnUpdateCheck').disabled = updateBusy || !!update.installing;
+  renderUpdateChannel(update);
+}
+
+// renderUpdateChannel 展示「更新走哪条通道」与上次失败的归因（issue #198）。
+//
+// 现场痛点：api.github.com 通、release-assets 被拦时，面板只显示一句原始超时文本，
+// 用户既不知道自己有没有走代理，也不知道下一步该配什么。这里把通道名与类目直接
+// 摆出来，并把类目翻成一句人话建议。
+const UPDATE_CHANNEL_LABEL = {
+  'direct': '直连（已关闭环境变量代理）',
+  'direct(env)': '直连（跟随环境变量）',
+  'proxy': '代理',
+  'mirror': '镜像',
+  'mirror+proxy': '镜像 + 代理',
+};
+const UPDATE_ERROR_ADVICE = {
+  'dns': '域名解析失败：检查容器 DNS（可用 dns_servers）与出站策略。',
+  'connect': 'TCP 连不上：出站被拦或网络不可达；可配「更新代理」或「镜像前缀」绕行。',
+  'tls': 'TLS 握手/证书失败：常见于中间设备劫持或系统 CA 过期；先试镜像。',
+  'header-timeout': '等响应头超时：出站到 release-assets 很可能被拦（api.github.com 往往仍通）；配代理或镜像即可。',
+  'body-stall': '下载中途停滞：链路抖动或镜像限速；换镜像或配代理。',
+  'checksum': '摘要/尺寸不符：下载内容被中间层改写；换回直连或换可信镜像（不要放宽校验）。',
+  'http': '对方返回非 200：镜像不可用或前缀路径不对；检查镜像前缀。',
+  'proxy-config': '代理地址不合法；只支持 http、https、socks5 三种协议。',
+  'mirror-config': '镜像前缀不合法；需要 http 或 https 加主机名加斜杠的形式。',
+};
+function renderUpdateChannel(update) {
+  const el = $('updateChannel');
+  if (!el) return;
+  const bits = ['通道：' + (UPDATE_CHANNEL_LABEL[update.channel] || update.channel || '未知')];
+  if (update.proxy_host) bits.push('代理 ' + update.proxy_host);
+  if (update.mirror) bits.push('镜像 ' + update.mirror);
+  el.textContent = bits.join(' · ');
+  const advice = UPDATE_ERROR_ADVICE[update.last_error_kind];
+  if (advice) {
+    el.textContent += ' ｜ 上次失败[' + update.last_error_kind + ']：' + advice;
+    el.style.color = 'var(--warn)';
+  } else {
+    el.style.color = '';
+  }
+}
+
+// 测试连通性：分别探「版本元数据」与「资产下载」两条路，把结果逐行摆出来。
+// 检查更新只回答「有没有新版本」，通道坏的时候它给不出「坏在哪一段」。
+async function probeUpdateChannel() {
+  const button = $('btnUpdateProbe');
+  const out = $('updateProbeOut');
+  button.disabled = true;
+  button.textContent = '探测中…';
+  out.hidden = false;
+  out.textContent = '正在探测…';
+  try {
+    const r = await api('update/probe', { method: 'POST' });
+    const rows = [r.meta, r.asset].filter(Boolean).map(p => {
+      const state = p.ok ? '通' : ('失败[' + (p.kind || 'unknown') + ']');
+      const extra = p.ok ? ('HTTP ' + p.status) : (p.error || '');
+      return p.target + '：' + state + ' · ' + p.elapsed_ms + 'ms · ' + extra;
+    });
+    out.innerHTML = rows.map(t => '<div>' + esc(t) + '</div>').join('');
+    const advice = UPDATE_ERROR_ADVICE[(r.meta && r.meta.kind) || (r.asset && r.asset.kind)];
+    if (advice) out.innerHTML += '<div style="color:var(--warn)">' + esc(advice) + '</div>';
+    if (r.update) renderUpdateStatus(r.update);
+  } catch (e) {
+    out.textContent = '探测失败：' + e.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = '测试连通性';
+  }
 }
 
 async function checkForUpdates() {
@@ -810,6 +878,7 @@ function openLatestRelease() {
 }
 
 if ($('btnUpdateCheck')) $('btnUpdateCheck').onclick = checkForUpdates;
+if ($('btnUpdateProbe')) $('btnUpdateProbe').onclick = probeUpdateChannel;
 if ($('btnUpdateInstall')) $('btnUpdateInstall').onclick = installUpdate;
 if ($('btnUpdateRelease')) $('btnUpdateRelease').onclick = openLatestRelease;
 if ($('navUpdate')) $('navUpdate').onclick = () => {
@@ -988,15 +1057,28 @@ if ($('accGroupActions')) {
     if (b.dataset.gact !== 'checkin' &&
         !confirm('对分组「' + accGroupFilter + '」的 ' + targets.length + ' 个账号执行「' + act.verb + '」？')) return;
     b.disabled = true;
-    let ok = 0;
+    let ok = 0, already = 0;
     const bad = [];
     for (const s of targets) {
-      try { await api('accounts/' + encodeURIComponent(s.uid) + '/' + b.dataset.gact, { method: 'POST' }); ok++; }
-      catch (e) { bad.push((s.nickname || String(s.uid).slice(0, 8)) + '：' + e.message); }
+      const name = s.nickname || String(s.uid).slice(0, 8);
+      try {
+        const r = await api('accounts/' + encodeURIComponent(s.uid) + '/' + b.dataset.gact, { method: 'POST' });
+        /* 签到端点对失败也回 200（错误在 body 里）：只按 HTTP 成功计数，会把「今天早就
+           签过」和上游拒签一起算进「成功 N 个」——hub#875 那类误报的同一个根。
+           按 checkin_state 分开统计，already 单独报，不冒充新签到。 */
+        if (b.dataset.gact === 'checkin') {
+          if (r && r.checkin_state === 'already') { already++; continue; }
+          if (r && r.ok === false) { bad.push(name + '：' + (r.checkin_message || '未完成')); continue; }
+        }
+        ok++;
+      } catch (e) { bad.push(name + '：' + e.message); }
     }
     b.disabled = false;
-    toast('组内' + act.verb + '：成功 ' + ok + ' 个' +
-      (bad.length ? '，失败 ' + bad.length + ' 个（' + bad[0] + '）' : ''), bad.length ? 'warn' : 'ok');
+    const tail = bad.length ? '，失败 ' + bad.length + ' 个（' + bad[0] + '）' : '';
+    toast(b.dataset.gact === 'checkin'
+      ? '组内签到：新签到 ' + ok + ' 个' + (already ? '，今日已签 ' + already + ' 个' : '') + tail
+      : '组内' + act.verb + '：成功 ' + ok + ' 个' + tail,
+      bad.length ? 'warn' : 'ok');
     loadOverview(true);
   });
 }
@@ -1792,6 +1874,30 @@ function fmtBytes(bytes) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
   return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
+/* 运行日志导出：落盘文件按区间打包成 ZIP。
+ * 用 location.href 直接触发下载而不是 fetch+blob——落盘包可能几十 MB，
+ * blob 会把整包读进内存再复制一份；href 让浏览器原生流式落盘。
+ * 失败（落盘未启用 / 区间无数据）时后端回 JSON 错误，浏览器会把它当文件下载，
+ * 所以先 HEAD 一次拿状态码，非 2xx 就读回错误文案弹出来。 */
+$('btnLogExport').onclick = async () => {
+  const days = $('logExportDays').value || '3';
+  const url = '/panel/api/logs/export?days=' + encodeURIComponent(days);
+  try {
+    const resp = await fetch(url, {method: 'HEAD'});
+    if (!resp.ok) {
+      // HEAD 不带 body，再 GET 一次拿文案（数据量很小：只有一个错误 JSON）。
+      const detail = await fetch(url).then(r => r.text()).catch(() => '');
+      let msg = 'HTTP ' + resp.status;
+      try { msg = JSON.parse(detail).error || msg; } catch (e) { }
+      alert('导出失败：' + msg);
+      return;
+    }
+    location.href = url;
+  } catch (e) {
+    alert('导出失败：' + e);
+  }
+};
+
 $('btnLogPin').onclick = () => {
   logPin = !logPin;
   $('btnLogPin').textContent = '自动滚动：' + (logPin ? '开' : '关');
@@ -1802,6 +1908,8 @@ const CFG_MAP = {
   listen: ['listen'], api_key: ['api_key'],
   package_detail_limit: ['panel', 'package_detail_limit'],
   update_auto_enabled: ['update', 'auto_enabled'], update_auto_time: ['update', 'auto_time'],
+  update_proxy: ['update', 'proxy'], update_mirror: ['update', 'mirror'],
+  update_proxy_from_env: ['update', 'proxy_from_env'],
   poll_interval_sec: ['panel', 'poll_interval_sec'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
@@ -2399,12 +2507,24 @@ let taskJobTimer = null, taskJobPolling = null, taskJobID = null, taskJobGenerat
 let taskJobsLoading = false;
 
 // 服务端状态与界面反馈共用的纯函数，避免把已提交/失败当成已完成。
+/* 签到四态文案（checkin_state 由后端按回执判定，见 upstream.CheckinState）：
+   checked = 本次真签到、上游发了积分；already = 今天早就签过、一个积分都没发；
+   pending = 上游还在处理；failed = 上游拒签。
+   关键：already 和 checked 的事实不同。以前只凭 checkin_done 一律显示「签到已完成」
+   （绿色），重复点按钮看起来像能无限刷积分——同类项目 hub#875 在生产 1288 条签到
+   记录里就踩了同一个坑（250 条幂等拒绝被报成「签到成功 (+100积分)」）。
+   积分数字只取上游这次真实带回的 checkin_credit，取不到就不显示，绝不硬编码。 */
 function checkinResultNote(r) {
   if (r.skipped) return { message: r.skip_reason || '该账号不适用签到', severity: '' };
-  const balance = r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '';
-  if (!r.checkin_done) return { message: '签到未完成：' + (r.checkin_error || r.checkin_message || '请稍后重试') + balance, severity: 'err' };
-  if (r.balance_error) return { message: '签到已完成；余额刷新失败：' + r.balance_error, severity: 'err' };
-  return { message: '签到已完成' + balance, severity: 'ok' };
+  const balance = r.credits != null ? '，当前积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '';
+  const state = r.checkin_state || (r.checkin_done ? 'checked' : 'failed');
+  if (state === 'skipped') return { message: r.checkin_message || r.skip_reason || '该账号不适用签到', severity: '' };
+  if (state === 'already') return { message: '今天已签到，无需重复，上游不会再发积分' + balance, severity: '' };
+  if (state === 'pending') return { message: '签到未完成：上游还在处理，稍后重试' + balance, severity: 'warn' };
+  if (state !== 'checked') return { message: '签到未完成：' + (r.checkin_message || '请稍后重试') + balance, severity: 'err' };
+  const gain = typeof r.checkin_credit === 'number' ? '，+' + r.checkin_credit + ' 积分' : '';
+  if (r.balance_error) return { message: '签到成功' + gain + '；余额刷新失败：' + r.balance_error, severity: 'err' };
+  return { message: '签到成功' + gain + balance, severity: 'ok' };
 }
 
 function taskOutcomeStatus(item) {
@@ -3943,7 +4063,7 @@ function expBucketList(a) {
   for (const b of raw) {
     const date = String((b && b.date) || '').slice(0, 10);
     const remain = Number((b && b.remain) || 0);
-    if (date && remain > 0) out.push({ date, remain });
+    if (date && remain > 0) out.push({ date, remain, estimated: !!(b && b.estimated) });
   }
   if (out.length) {
     out.sort((x, y) => (x.date < y.date ? -1 : x.date > y.date ? 1 : 0));
@@ -4002,6 +4122,7 @@ function renderExpirySnapshot(d) {
       '<span class="exp-date">' + esc(first.date) + '</span>' +
       '<span class="exp-days">（' + when + '）</span>' +
       (week > first.remain ? '<span class="exp-week">7 天内合计 <b>' + fmtTok(week) + '</b></span>' : '') +
+      (first.estimated ? '<span class="exp-est" title="该日期是按计量周期（CycleEndTime）推算的，不是上游给出的真实扣费截止">按计量周期推算</span>' : '') +
       '</div>';
     const rest = bs.slice(1, 4).map(b => '<span>随后 ' + esc(b.date.slice(5)) + ' · ' +
       fmtTok(b.remain) + '</span>').join('');
